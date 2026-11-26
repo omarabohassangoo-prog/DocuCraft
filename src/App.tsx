@@ -18,7 +18,10 @@ import {
 } from './client/pages/PublicPages.tsx';
 import { CheckoutPage, InvoiceView } from './client/pages/CheckoutPage.tsx';
 import { AuthPages } from './client/pages/AuthPages.tsx';
-import { DashboardShell } from './client/pages/DashboardShell.tsx';
+
+const DashboardShell = React.lazy(() =>
+  import('./client/pages/DashboardShell.tsx').then((module) => ({ default: module.DashboardShell }))
+);
 
 const RouterView: React.FC = () => {
   const { route, user, bootstrap, navigate, locale } = useApp();
@@ -50,7 +53,17 @@ const RouterView: React.FC = () => {
   }
 
   if (route.startsWith('/dashboard')) {
-    return <DashboardShell />;
+    return (
+      <React.Suspense
+        fallback={(
+          <div role="status" aria-live="polite" className="flex min-h-screen items-center justify-center text-sm text-[var(--text-secondary)]">
+            {locale === 'ar' ? 'جارٍ تحميل لوحة التحكم...' : 'Loading dashboard...'}
+          </div>
+        )}
+      >
+        <DashboardShell />
+      </React.Suspense>
+    );
   }
 
   const renderPublicView = () => {

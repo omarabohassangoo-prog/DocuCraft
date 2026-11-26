@@ -38,14 +38,24 @@ import { apiRequest } from '../lib/api.ts';
 import { useApp } from '../context/AppContext.tsx';
 import { pickI18n, t } from '../i18n/dictionary.ts';
 import { AdvancedDataTable } from '../components/crud/AdvancedDataTable.tsx';
-import {
-  AdminAuditAndLogsView,
-  AdminCmsEditorView,
-  AdminOverviewView,
-  AdminSeoAdsView,
-  AdminSettingsVaultView,
-  AdminUsersRbacView,
-} from './AdminViews.tsx';
+const AdminAuditAndLogsView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminAuditAndLogsView }))
+);
+const AdminCmsEditorView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminCmsEditorView }))
+);
+const AdminOverviewView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminOverviewView }))
+);
+const AdminSeoAdsView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminSeoAdsView }))
+);
+const AdminSettingsVaultView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminSettingsVaultView }))
+);
+const AdminUsersRbacView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminUsersRbacView }))
+);
 import {
   CustomerDashboardView,
   ModeratorDashboardView,
