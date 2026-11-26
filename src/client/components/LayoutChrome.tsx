@@ -393,27 +393,45 @@ export const GdprConsentBar: React.FC = () => {
 export const AdSenseSlot: React.FC<{ placement: 'blog_sidebar' | 'catalog_top' | 'home_mid' | 'article_middle' }> = ({
   placement,
 }) => {
-  const { route, bootstrap, gdprConsent, locale } = useApp();
-
-  // Strictly suppress on checkout, auth, and dashboard routes
-  if (route.startsWith('/checkout') || route.startsWith('/auth') || route.startsWith('/dashboard')) {
-    return null;
-  }
+  const { route, bootstrap, gdprConsent } = useApp();
+  const isSuppressedRoute =
+    route.startsWith('/checkout') || route.startsWith('/auth') || route.startsWith('/dashboard');
   const adsEnabled = bootstrap?.settings?.['feature_flags.enable_adsense'] === true;
-  if (!adsEnabled || gdprConsent === 'essential') return null;
-
   const unit = bootstrap?.adUnits?.find((a) => a.placement === placement && a.is_active);
-  if (!unit) return null;
+  const validClient = Boolean(unit && /^ca-pub-\d{10,20}$/.test(unit.adsense_client_id));
+  const shouldRender = !isSuppressedRoute && adsEnabled && gdprConsent === 'all' && validClient;
+
+  React.useEffect(() => {
+    if (!shouldRender || !unit) return;
+    const scriptId = 'ufuq-adsense-script';
+    if (!document.getElementById(scriptId)) {
+      const s = document.createElement('script');
+      s.id = scriptId;
+      s.async = true;
+      s.crossOrigin = 'anonymous';
+      s.src = `https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${encodeURIComponent(unit.adsense_client_id)}`;
+      document.head.appendChild(s);
+    }
+    try {
+      const win = window as Window & { adsbygoogle?: unknown[] };
+      win.adsbygoogle = win.adsbygoogle || [];
+      win.adsbygoogle.push({});
+    } catch {
+      // ignore adblock or duplicate push
+    }
+  }, [shouldRender, unit]);
+
+  if (!shouldRender || !unit) return null;
 
   return (
-    <div className="rounded-xl border border-dashed border-[var(--border-hairline)] bg-[var(--surface-muted)]/60 p-4 text-center space-y-1.5 no-print">
-      <div className="text-[11px] uppercase tracking-wider text-[var(--text-secondary)]">
-        {t(locale, 'sponsored_label')}
-      </div>
-      <div className="text-sm font-semibold text-[var(--text-primary)]">{unit.name}</div>
-      <div className="font-mono-tabular text-[11px] text-[var(--text-secondary)]">
-        {unit.adsense_client_id} · Slot #{unit.adsense_slot_id}
-      </div>
+    <div className="overflow-hidden rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-2 no-print">
+      <ins
+        className="adsbygoogle block"
+        data-ad-client={unit.adsense_client_id}
+        data-ad-slot={unit.adsense_slot_id}
+        data-ad-format={unit.ad_format}
+        data-full-width-responsive="true"
+      />
     </div>
   );
 };

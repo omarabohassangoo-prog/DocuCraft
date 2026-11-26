@@ -1,4 +1,4 @@
-import express, { type Express } from 'express';
+import express, { type Express, type Request } from 'express';
 import dotenv from 'dotenv';
 import { dbStore } from './core/db.ts';
 import { cacheStore } from './core/cache.ts';
@@ -8,6 +8,7 @@ import { publicRouter } from './modules/public.routes.ts';
 import { commerceRouter } from './modules/commerce.routes.ts';
 import { crudRouter } from './modules/crud.routes.ts';
 import { adminRouter } from './modules/admin.routes.ts';
+import { mediaRouter, publicMediaRouter } from './modules/media.routes.ts';
 
 dotenv.config();
 
@@ -15,9 +16,16 @@ export function createApiApp(): Express {
   const app = express();
 
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '2mb' }));
+  app.use(
+    express.json({
+      limit: '8mb',
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+      },
+    })
+  );
 
-  // Ensure Postgres state is initialized & synchronized before handling API/SEO requests
+  // Ensure Postgres 30-table relational store is initialized & synced
   app.use(async (req, res, next) => {
     if (
       req.path.startsWith('/api/') ||
@@ -70,7 +78,8 @@ export function createApiApp(): Express {
     res.json({
       status: 'ready',
       runtime: process.env.VERCEL === '1' ? 'vercel-serverless' : 'node-server',
-      storage: dbStore.isPostgresEnabled() ? 'postgresql' : 'file-store',
+      storage: dbStore.isPostgresEnabled() ? 'postgresql-normalized-30-tables' : 'local-file-store',
+      readReplica: dbStore.hasReadReplica(),
       database: { connected: true, tenants: db.tenants.length, tables: 30 },
       cache: cacheStore.stats(),
       timestamp: new Date().toISOString(),
@@ -90,10 +99,15 @@ export function createApiApp(): Express {
         '/api/v1/health/ready': { get: { summary: 'Readiness probe' } },
         '/api/v1/auth/login': { post: { summary: 'Authenticate user with optional 2FA challenge' } },
         '/api/v1/auth/register': { post: { summary: 'Register customer or vendor account' } },
+        '/api/v1/auth/password/forgot': { post: { summary: 'Dispatch real OTP password recovery email' } },
+        '/api/v1/auth/password/reset': { post: { summary: 'Verify OTP and reset password' } },
         '/api/v1/auth/sidebar': { get: { summary: 'Resolve dynamic RBAC sidebar menu' } },
         '/api/v1/public/catalog': { get: { summary: 'Filterable multi-vendor product catalog' } },
-        '/api/v1/checkout/initiate': { post: { summary: 'Atomic stock reservation and vendor sub-order split' } },
-        '/api/v1/payments/capture': { post: { summary: 'Confirm tokenized payment and dispatch invoices' } },
+        '/api/v1/media/upload': { post: { summary: 'Upload image to S3/R2 or local storage' } },
+        '/api/v1/public/media/{id}': { get: { summary: 'Stream stored public media file' } },
+        '/api/v1/checkout/initiate': { post: { summary: 'Atomic stock reservation + real Stripe/PayPal/Tap session' } },
+        '/api/v1/payments/capture': { post: { summary: 'Verify & capture payment via live gateway API' } },
+        '/api/v1/webhooks/payments/{provider}': { post: { summary: 'Signed payment gateway webhook handler' } },
         '/api/v1/crud/{resource}': { get: { summary: 'Paginated CRUD listing with Look Fields' } },
         '/api/v1/admin/env-secrets': { post: { summary: 'Encrypt and store service API secret with AES-256-GCM' } },
       },
@@ -146,7 +160,9 @@ export function createApiApp(): Express {
 
   // Modular API Routers
   app.use('/api/v1/auth', authRouter);
+  app.use('/api/v1/public/media', publicMediaRouter);
   app.use('/api/v1/public', publicRouter);
+  app.use('/api/v1/media', mediaRouter);
   app.use('/api/v1', commerceRouter);
   app.use('/api/v1/crud', crudRouter);
   app.use('/api/v1/admin', adminRouter);

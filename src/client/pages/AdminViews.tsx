@@ -537,14 +537,20 @@ export const AdminSettingsVaultView: React.FC = () => {
   };
 
   const testConnection = async (serviceName: string) => {
-    const res = await apiRequest<{ service_name: string; source: string; status: string }>(
-      '/admin/env-secrets/test-connection',
-      {
+    try {
+      const res = await apiRequest<{
+        service_name: string;
+        status: string;
+        message: string;
+        latency_ms: number;
+      }>('/admin/env-secrets/test-connection', {
         method: 'POST',
         body: JSON.stringify({ service_name: serviceName }),
-      }
-    );
-    setPingResult(`${res.service_name}: ${res.status} (${res.source})`);
+      });
+      setPingResult(`${res.service_name}: ${res.status} — ${res.message} (${res.latency_ms}ms)`);
+    } catch (err) {
+      setPingResult(err instanceof Error ? err.message : 'Ping failed');
+    }
   };
 
   return (
@@ -599,7 +605,7 @@ export const AdminSettingsVaultView: React.FC = () => {
 
       {/* AES-256-GCM Encrypted Secrets Vault */}
       <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-6 space-y-5">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-[var(--brand-primary)]" />
             <h3 className="text-base font-bold text-[var(--text-primary)]">
@@ -607,7 +613,7 @@ export const AdminSettingsVaultView: React.FC = () => {
             </h3>
           </div>
           {pingResult && (
-            <span className="inline-flex items-center gap-1.5 text-xs font-mono-tabular text-emerald-700 dark:text-emerald-400">
+            <span className="inline-flex items-center gap-1.5 text-xs font-mono-tabular text-[var(--brand-primary)]">
               <CheckCircle2 className="h-3.5 w-3.5" />
               {pingResult}
             </span>
@@ -626,12 +632,18 @@ export const AdminSettingsVaultView: React.FC = () => {
                     onClick={() => testConnection(item.service_name)}
                     className="text-[11px] font-semibold text-[var(--brand-primary)] hover:underline"
                   >
-                    {locale === 'ar' ? 'فحص الاتصال' : 'Test Ping'}
+                    {locale === 'ar' ? 'فحص الاتصال الحي' : 'Live Ping'}
                   </button>
                 </div>
                 <div className="font-mono-tabular text-[11px] text-[var(--text-secondary)]">{item.env_key}</div>
                 <div className="font-mono-tabular text-xs text-[var(--text-primary)]">
-                  {stored ? `${stored.masked_preview} (v${stored.key_version})` : item.configured_in_env ? 'Configured in ENV' : 'Sandbox Mode'}
+                  {stored
+                    ? `${stored.masked_preview} (v${stored.key_version})`
+                    : item.configured_in_env
+                      ? 'Configured in ENV'
+                      : locale === 'ar'
+                        ? 'غير مضبوط بعد'
+                        : 'Not Configured'}
                 </div>
               </div>
             );
@@ -649,6 +661,7 @@ export const AdminSettingsVaultView: React.FC = () => {
                 email: 'RESEND_API_KEY',
                 sms: 'TWILIO_AUTH_TOKEN',
                 whatsapp: 'WHATSAPP_ACCESS_TOKEN',
+                storage: 'STORAGE_ACCESS_KEY_ID',
               };
               setSecretForm({
                 ...secretForm,
@@ -661,9 +674,10 @@ export const AdminSettingsVaultView: React.FC = () => {
             <option value="stripe">Stripe</option>
             <option value="paypal">PayPal</option>
             <option value="mada_tap">Mada / Tap</option>
-            <option value="email">Resend Email</option>
+            <option value="email">Resend / SendGrid / SMTP</option>
             <option value="sms">Twilio SMS</option>
             <option value="whatsapp">WhatsApp Cloud</option>
+            <option value="storage">S3 / R2 Storage</option>
           </select>
 
           <input

@@ -526,16 +526,89 @@ const RESOURCE_SCHEMAS: Record<string, CrudResourceMetadata> = {
   },
 };
 
+function getOwnedVendorIds(db: DatabaseSchema, userId: string, tenantId: string, fallbackVendorId?: string | null): Set<string> {
+  const ids = new Set(
+    db.vendors
+      .filter((v) => v.tenant_id === tenantId && v.owner_user_id === userId)
+      .map((v) => v.id)
+  );
+  if (fallbackVendorId) ids.add(fallbackVendorId);
+  return ids;
+}
+
+function assertResourceReadAccess(resource: string, user: NonNullable<AuthRequest['authUser']>): void {
+  const role = user.user_type;
+  if (role === 'super_admin') return;
+
+  switch (resource) {
+    case 'products':
+      if (!['moderator', 'vendor'].includes(role)) {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to products CRUD' });
+      }
+      return;
+    case 'vendors':
+      if (role !== 'moderator') {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to vendors CRUD' });
+      }
+      return;
+    case 'vendor_suborders':
+      if (!['staff', 'vendor'].includes(role)) {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to vendor sub-orders' });
+      }
+      return;
+    case 'audit_logs':
+      if (role !== 'moderator') {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to audit logs' });
+      }
+      return;
+    case 'blog_posts':
+    case 'contact_inquiries':
+      if (!['moderator', 'staff'].includes(role)) {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: `Access denied to ${resource}` });
+      }
+      return;
+    case 'users':
+    case 'notification_logs':
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: `Only Super Admin can access ${resource}` });
+    default:
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied' });
+  }
+}
+
+function canInlineEditField(resource: string, field: string, user: NonNullable<AuthRequest['authUser']>): boolean {
+  const role = user.user_type;
+  if (role === 'super_admin') return true;
+  if (resource === 'products') {
+    if (role === 'vendor') return ['title_i18n', 'base_price', 'total_stock', 'status'].includes(field);
+    if (role === 'moderator') return ['status', 'is_featured'].includes(field);
+    return false;
+  }
+  if (resource === 'vendors') {
+    if (role === 'moderator') return ['kyc_status', 'is_active'].includes(field);
+    return false;
+  }
+  if (resource === 'vendor_suborders') {
+    if (['staff', 'vendor'].includes(role)) return ['tracking_number', 'fulfillment_status'].includes(field);
+    return false;
+  }
+  if (resource === 'blog_posts' || resource === 'contact_inquiries') {
+    return ['moderator', 'staff'].includes(role) && field === 'status';
+  }
+  return false;
+}
+
 function getRowsForResource(db: DatabaseSchema, resource: string, req: AuthRequest): Record<string, unknown>[] {
   const user = req.authUser!;
   const tid = req.tenantId;
+  assertResourceReadAccess(resource, user);
 
   switch (resource) {
     case 'products': {
+      const ownedVendorIds = user.user_type === 'vendor' ? getOwnedVendorIds(db, user.id, tid, user.vendor_id) : null;
       return db.products
         .filter((p) => {
           if (p.tenant_id !== tid || p.deleted_at) return false;
-          if (user.user_type === 'vendor' && user.vendor_id) return p.vendor_id === user.vendor_id;
+          if (ownedVendorIds) return ownedVendorIds.has(p.vendor_id);
           return true;
         })
         .map((p) => {
@@ -553,10 +626,11 @@ function getRowsForResource(db: DatabaseSchema, resource: string, req: AuthReque
       return db.vendors.filter((v) => v.tenant_id === tid) as unknown as Record<string, unknown>[];
     }
     case 'vendor_suborders': {
+      const ownedVendorIds = user.user_type === 'vendor' ? getOwnedVendorIds(db, user.id, tid, user.vendor_id) : null;
       return db.vendor_suborders
         .filter((s) => {
           if (s.tenant_id !== tid) return false;
-          if (user.user_type === 'vendor' && user.vendor_id) return s.vendor_id === user.vendor_id;
+          if (ownedVendorIds) return ownedVendorIds.has(s.vendor_id);
           return true;
         })
         .map((s) => {
@@ -569,9 +643,6 @@ function getRowsForResource(db: DatabaseSchema, resource: string, req: AuthReque
         });
     }
     case 'audit_logs': {
-      if (!['super_admin', 'moderator'].includes(user.user_type)) {
-        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to audit logs' });
-      }
       return db.audit_logs
         .filter((a) => a.tenant_id === tid)
         .map((a) => {
@@ -580,9 +651,6 @@ function getRowsForResource(db: DatabaseSchema, resource: string, req: AuthReque
         });
     }
     case 'users': {
-      if (user.user_type !== 'super_admin') {
-        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Only Super Admin can manage users' });
-      }
       return db.users
         .filter((u) => u.tenant_id === tid)
         .map(({ password_hash: _ph, two_factor_secret_enc: _tfa, ...safe }) => safe);
@@ -603,11 +671,23 @@ function getRowsForResource(db: DatabaseSchema, resource: string, req: AuthReque
 
 crudRouter.get('/:resource/schema', (req, res, next) => {
   try {
+    const authReq = req as unknown as AuthRequest;
     const schema = RESOURCE_SCHEMAS[req.params.resource];
     if (!schema) {
       throw new AppError({ status: 404, code: 'SCHEMA_NOT_FOUND', message: 'Resource schema not found' });
     }
-    res.json({ success: true, data: schema });
+    assertResourceReadAccess(req.params.resource, authReq.authUser!);
+    const roleAwareSchema: CrudResourceMetadata = {
+      ...schema,
+      fields: schema.fields.map((f) => ({
+        ...f,
+        inline_edit: {
+          ...f.inline_edit,
+          enabled: f.inline_edit.enabled && canInlineEditField(schema.resource, f.field, authReq.authUser!),
+        },
+      })),
+    };
+    res.json({ success: true, data: roleAwareSchema });
   } catch (err) {
     next(err);
   }
@@ -698,13 +778,20 @@ crudRouter.patch('/:resource/:id/inline', async (req, res, next) => {
     if (!fieldMeta || !fieldMeta.inline_edit.enabled) {
       throw new AppError({ status: 400, code: 'INLINE_EDIT_DISABLED', message: `Field ${field} is not inline-editable.` });
     }
+    assertResourceReadAccess(resource, authReq.authUser!);
+    if (!canInlineEditField(resource, field, authReq.authUser!)) {
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: `Role ${authReq.authUser!.user_type} cannot edit ${resource}.${field}` });
+    }
 
     const updated = await dbStore.withTransaction((db) => {
       const nowIso = new Date().toISOString();
+      const user = authReq.authUser!;
+      const ownedVendorIds = user.user_type === 'vendor' ? getOwnedVendorIds(db, user.id, authReq.tenantId, user.vendor_id) : null;
+
       if (resource === 'products') {
         const prod = db.products.find((p) => p.id === id && p.tenant_id === authReq.tenantId);
         if (!prod) throw new AppError({ status: 404, code: 'NOT_FOUND', message: 'Product not found' });
-        if (authReq.authUser!.user_type === 'vendor' && prod.vendor_id !== authReq.authUser!.vendor_id) {
+        if (ownedVendorIds && !ownedVendorIds.has(prod.vendor_id)) {
           throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Cannot edit another vendor product' });
         }
         if (field === 'base_price') {
@@ -730,9 +817,6 @@ crudRouter.patch('/:resource/:id/inline', async (req, res, next) => {
       }
 
       if (resource === 'vendors') {
-        if (!['super_admin', 'moderator'].includes(authReq.authUser!.user_type)) {
-          throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Insufficient privileges' });
-        }
         const vendor = db.vendors.find((v) => v.id === id && v.tenant_id === authReq.tenantId);
         if (!vendor) throw new AppError({ status: 404, code: 'NOT_FOUND', message: 'Vendor not found' });
         if (field === 'kyc_status' && typeof value === 'string') vendor.kyc_status = value as typeof vendor.kyc_status;
@@ -745,7 +829,7 @@ crudRouter.patch('/:resource/:id/inline', async (req, res, next) => {
       if (resource === 'vendor_suborders') {
         const sub = db.vendor_suborders.find((s) => s.id === id && s.tenant_id === authReq.tenantId);
         if (!sub) throw new AppError({ status: 404, code: 'NOT_FOUND', message: 'Sub-order not found' });
-        if (authReq.authUser!.user_type === 'vendor' && sub.vendor_id !== authReq.authUser!.vendor_id) {
+        if (ownedVendorIds && !ownedVendorIds.has(sub.vendor_id)) {
           throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Cannot modify another vendor order' });
         }
         if (field === 'fulfillment_status' && typeof value === 'string') sub.fulfillment_status = value as typeof sub.fulfillment_status;
@@ -755,9 +839,6 @@ crudRouter.patch('/:resource/:id/inline', async (req, res, next) => {
       }
 
       if (resource === 'users') {
-        if (authReq.authUser!.user_type !== 'super_admin') {
-          throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Super Admin only' });
-        }
         const target = db.users.find((u) => u.id === id && u.tenant_id === authReq.tenantId);
         if (!target) throw new AppError({ status: 404, code: 'NOT_FOUND', message: 'User not found' });
         if (field === 'status' && typeof value === 'string') target.status = value as typeof target.status;
@@ -826,7 +907,7 @@ crudRouter.post('/products', async (req, res, next) => {
     if (!['super_admin', 'vendor'].includes(user.user_type)) {
       throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Only vendors or admins can create products' });
     }
-    const { title_ar, title_en, description_ar, description_en, base_price, stock_qty, category_id, sku, visual_theme } = req.body as Record<string, unknown>;
+    const { title_ar, title_en, description_ar, description_en, base_price, stock_qty, category_id, sku, visual_theme, primary_image_id } = req.body as Record<string, unknown>;
     if (!title_ar || !title_en || !base_price) {
       throw new AppError({ status: 400, code: 'VALIDATION_ERROR', message: 'Title and base price are required' });
     }
@@ -846,7 +927,7 @@ crudRouter.post('/products', async (req, res, next) => {
         slug,
         title_i18n: { ar: String(title_ar), en: String(title_en) },
         description_i18n: { ar: String(description_ar || title_ar), en: String(description_en || title_en) },
-        primary_image_id: null,
+        primary_image_id: typeof primary_image_id === 'string' && primary_image_id ? primary_image_id : null,
         gallery_media_ids: [],
         visual_theme: String(visual_theme || 'speaker'),
         base_price: Number(base_price),

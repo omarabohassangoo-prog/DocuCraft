@@ -155,7 +155,7 @@ export const InvoiceView: React.FC<{ orderId: string }> = ({ orderId }) => {
 };
 
 export const CheckoutPage: React.FC = () => {
-  const { locale, user, cart, refreshCart, navigate, notify } = useApp();
+  const { locale, user, cart, refreshCart, navigate, notify, searchQuery } = useApp();
   const [gateway, setGateway] = useState<'mada_tap' | 'stripe' | 'paypal'>('mada_tap');
   const [address, setAddress] = useState({
     full_name: user?.full_name?.split('|')[0]?.trim() || '',
@@ -166,6 +166,45 @@ export const CheckoutPage: React.FC = () => {
   });
   const [processing, setProcessing] = useState(false);
   const [completedOrderId, setCompletedOrderId] = useState<string | null>(null);
+
+  // Handle return callback from Stripe / PayPal / Tap hosted payment pages
+  useEffect(() => {
+    const params = new URLSearchParams(searchQuery || window.location.search);
+    const returnedGateway = params.get('gateway');
+    const returnedOrderId = params.get('order_id');
+    const cancelled = params.get('cancelled');
+
+    if (cancelled === 'true') {
+      notify(locale === 'ar' ? 'تم إلغاء عملية الدفع لدى البوابة.' : 'Payment was cancelled at the gateway.', 'info');
+      return;
+    }
+
+    const gatewayTxId =
+      params.get('session_id') ||
+      params.get('token') ||
+      params.get('tap_id');
+
+    if (returnedGateway && returnedOrderId && gatewayTxId && user) {
+      setProcessing(true);
+      apiRequest('/payments/capture', {
+        method: 'POST',
+        body: JSON.stringify({
+          order_id: returnedOrderId,
+          gateway_tx_id: gatewayTxId,
+        }),
+      })
+        .then(async () => {
+          await refreshCart();
+          setCompletedOrderId(returnedOrderId);
+          window.history.replaceState({}, '', '/checkout');
+          notify(t(locale, 'order_confirmed'), 'success');
+        })
+        .catch((err) => {
+          notify(err instanceof Error ? err.message : 'Payment verification failed', 'error');
+        })
+        .finally(() => setProcessing(false));
+    }
+  }, [searchQuery, user, locale, notify, refreshCart]);
 
   if (completedOrderId) {
     return <InvoiceView orderId={completedOrderId} />;
@@ -198,6 +237,7 @@ export const CheckoutPage: React.FC = () => {
       const init = await apiRequest<{
         order: OrderRecord;
         transaction: PaymentTransactionRecord;
+        redirect_url: string | null;
       }>('/checkout/initiate', {
         method: 'POST',
         body: JSON.stringify({
@@ -206,12 +246,16 @@ export const CheckoutPage: React.FC = () => {
         }),
       });
 
+      if (init.redirect_url) {
+        window.location.assign(init.redirect_url);
+        return;
+      }
+
       await apiRequest('/payments/capture', {
         method: 'POST',
         body: JSON.stringify({
           order_id: init.order.id,
           transaction_id: init.transaction.id,
-          card_last4: gateway === 'mada_tap' ? '4821' : '4242',
         }),
       });
 

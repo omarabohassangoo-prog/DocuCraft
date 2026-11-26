@@ -31,6 +31,8 @@ export const AuthPages: React.FC<{ mode: 'login' | 'register' | 'forgot' }> = ({
   // Forgot password state
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSent, setForgotSent] = useState(false);
+  const [resetCode, setResetCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
 
   const [submitting, setSubmitting] = useState(false);
 
@@ -143,29 +145,85 @@ export const AuthPages: React.FC<{ mode: 'login' | 'register' | 'forgot' }> = ({
     }
   };
 
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      await apiRequest('/auth/password/reset', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: forgotEmail,
+          code: resetCode,
+          new_password: newPassword,
+        }),
+      });
+      notify(
+        locale === 'ar' ? 'تم تغيير كلمة المرور بنجاح، يمكنك تسجيل الدخول الآن' : 'Password reset complete. You may now sign in.',
+        'success'
+      );
+      navigate('/auth/login');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Reset failed', 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   if (mode === 'forgot') {
     return (
       <div className="mx-auto max-w-md px-4 py-16">
-        <form
-          onSubmit={handleForgot}
-          className="rounded-2xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-7 space-y-5"
-        >
+        <div className="rounded-2xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-7 space-y-5">
           <div className="space-y-1">
             <h1 className="text-xl font-bold text-[var(--text-primary)]">{t(locale, 'forgot_password')}</h1>
             <p className="text-xs text-[var(--text-secondary)]">
               {locale === 'ar'
-                ? 'أدخل بريدك الإلكتروني لإرسال رمز التحقق المؤقت.'
-                : 'Enter your email address to queue a one-time recovery code.'}
+                ? 'أدخل بريدك الإلكتروني لإرسال رمز التحقق المكون من 6 أرقام.'
+                : 'Enter your email address to receive a 6-digit recovery code.'}
             </p>
           </div>
           {forgotSent ? (
-            <div className="rounded-lg bg-emerald-50 p-3 text-xs text-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
-              {locale === 'ar'
-                ? 'إذا كان البريد مسجلاً لدينا، فقد تم إرسال تعليمات الاستعادة.'
-                : 'If the email is registered, recovery instructions have been dispatched.'}
-            </div>
+            <form onSubmit={handleResetPassword} className="space-y-4">
+              <div className="rounded-lg bg-emerald-50 p-3 text-xs text-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+                {locale === 'ar'
+                  ? 'إذا كان البريد مسجلاً لدينا، فقد تم إرسال رمز الاستعادة. أدخل الرمز وكلمة المرور الجديدة أدناه.'
+                  : 'If the email is registered, a 6-digit recovery code was sent. Enter it below.'}
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
+                  {locale === 'ar' ? 'رمز التحقق (6 أرقام)' : '6-Digit Recovery Code'}
+                </label>
+                <input
+                  required
+                  maxLength={6}
+                  value={resetCode}
+                  onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ''))}
+                  placeholder="000000"
+                  className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2.5 text-center font-mono-tabular text-base tracking-[0.3em]"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
+                  {locale === 'ar' ? 'كلمة المرور الجديدة' : 'New Password'}
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2.5 text-sm"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={submitting || resetCode.length !== 6}
+                className="w-full rounded-xl bg-[var(--brand-primary)] py-2.5 text-sm font-semibold text-white disabled:opacity-45"
+              >
+                {locale === 'ar' ? 'تعيين كلمة المرور' : 'Reset Password'}
+              </button>
+            </form>
           ) : (
-            <>
+            <form onSubmit={handleForgot} className="space-y-4">
               <div>
                 <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">{t(locale, 'email')}</label>
                 <input
@@ -183,7 +241,7 @@ export const AuthPages: React.FC<{ mode: 'login' | 'register' | 'forgot' }> = ({
               >
                 {t(locale, 'send_reset_link')}
               </button>
-            </>
+            </form>
           )}
           <button
             type="button"
@@ -192,7 +250,7 @@ export const AuthPages: React.FC<{ mode: 'login' | 'register' | 'forgot' }> = ({
           >
             {t(locale, 'nav_signin')}
           </button>
-        </form>
+        </div>
       </div>
     );
   }

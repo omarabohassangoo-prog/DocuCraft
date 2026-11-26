@@ -42,10 +42,19 @@ const ProductCard: React.FC<{ product: CatalogProduct }> = ({ product }) => {
         onClick={() => navigate(`/products/${product.slug}`)}
         className="block aspect-[4/3] w-full overflow-hidden bg-[var(--surface-muted)]/60 p-4 text-start"
       >
-        <ProductArtwork
-          theme={product.visual_theme}
-          className="h-full w-full transition-transform duration-300 group-hover:scale-[1.03]"
-        />
+        {product.primary_image_id ? (
+          <img
+            src={`/api/v1/public/media/${product.primary_image_id}`}
+            alt={pickI18n(product.title_i18n, locale)}
+            loading="lazy"
+            className="h-full w-full rounded-lg object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+          />
+        ) : (
+          <ProductArtwork
+            theme={product.visual_theme}
+            className="h-full w-full transition-transform duration-300 group-hover:scale-[1.03]"
+          />
+        )}
       </button>
 
       <div className="flex flex-1 flex-col p-5 space-y-3">
@@ -415,8 +424,16 @@ export const ProductDetailPage: React.FC<{ slug: string }> = ({ slug }) => {
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6 lg:px-8">
       <div className="grid grid-cols-1 gap-10 lg:grid-cols-12">
         <div className="lg:col-span-6">
-          <div className="sticky top-24 aspect-[4/3] rounded-2xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-8">
-            <ProductArtwork theme={product.visual_theme} />
+          <div className="sticky top-24 aspect-[4/3] rounded-2xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-8 overflow-hidden">
+            {product.primary_image_id ? (
+              <img
+                src={`/api/v1/public/media/${product.primary_image_id}`}
+                alt={pickI18n(product.title_i18n, locale)}
+                className="h-full w-full rounded-xl object-cover"
+              />
+            ) : (
+              <ProductArtwork theme={product.visual_theme} />
+            )}
           </div>
         </div>
 

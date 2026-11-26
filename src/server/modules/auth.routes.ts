@@ -22,6 +22,7 @@ import {
   recordAuditLog,
   type AuthRequest,
 } from '../core/auth-guard.ts';
+import { dispatchRealNotification } from '../services/notifications.service.ts';
 
 export const authRouter = Router();
 authRouter.use(attachTenantAndAuth);
@@ -236,20 +237,6 @@ authRouter.post('/register', async (req, res, next) => {
         created_at: nowIso,
       });
 
-      db.notification_logs.unshift({
-        id: crypto.randomUUID(),
-        tenant_id: authReq.tenantId,
-        user_id: userId,
-        channel: 'email',
-        provider: 'resend',
-        recipient: normalizedEmail,
-        provider_message_id: `re_${crypto.randomBytes(5).toString('hex')}`,
-        status: 'sent',
-        error_message: null,
-        sent_at: nowIso,
-        created_at: nowIso,
-      });
-
       const accessToken = signAccessToken({
         sub: userId,
         tid: authReq.tenantId,
@@ -258,6 +245,15 @@ authRouter.post('/register', async (req, res, next) => {
       });
 
       return { user, accessToken };
+    });
+
+    await dispatchRealNotification({
+      tenantId: authReq.tenantId,
+      userId: created.user.id,
+      channel: 'email',
+      recipient: created.user.email,
+      subject: 'Welcome to Ufuq Commerce',
+      textBody: `Welcome ${created.user.full_name}! Your account has been created successfully.`,
     });
 
     await recordAuditLog({
@@ -512,42 +508,115 @@ authRouter.post('/password/forgot', async (req, res, next) => {
     }
     const { email } = z.object({ email: z.string().email() }).parse(req.body);
     const nowIso = new Date().toISOString();
-    await dbStore.withTransaction((db) => {
+
+    const resetTarget = await dbStore.withTransaction((db) => {
       const user = db.users.find((u) => u.email.toLowerCase() === email.toLowerCase() && u.tenant_id === authReq.tenantId);
-      if (user) {
-        const otpCode = String(Math.floor(100000 + Math.random() * 900000));
-        db.otp_verifications.push({
-          id: crypto.randomUUID(),
-          tenant_id: authReq.tenantId,
-          user_id: user.id,
-          channel: 'email',
-          purpose: 'reset_password',
-          target: user.email,
-          code_hash: sha256(otpCode),
-          attempts: 0,
-          expires_at: new Date(Date.now() + 900 * 1000).toISOString(),
-          verified_at: null,
-          created_at: nowIso,
-        });
-        db.notification_logs.unshift({
-          id: crypto.randomUUID(),
-          tenant_id: authReq.tenantId,
-          user_id: user.id,
-          channel: 'email',
-          provider: 'resend',
-          recipient: user.email,
-          provider_message_id: `re_rst_${crypto.randomBytes(4).toString('hex')}`,
-          status: 'sent',
-          error_message: null,
-          sent_at: nowIso,
-          created_at: nowIso,
-        });
-      }
+      if (!user) return null;
+      const otpCode = String(crypto.randomInt(100000, 999999));
+      db.otp_verifications.push({
+        id: crypto.randomUUID(),
+        tenant_id: authReq.tenantId,
+        user_id: user.id,
+        channel: 'email',
+        purpose: 'reset_password',
+        target: user.email,
+        code_hash: sha256(otpCode),
+        attempts: 0,
+        expires_at: new Date(Date.now() + 900 * 1000).toISOString(),
+        verified_at: null,
+        created_at: nowIso,
+      });
+      return { userId: user.id, email: user.email, otpCode };
     });
+
+    if (resetTarget) {
+      await dispatchRealNotification({
+        tenantId: authReq.tenantId,
+        userId: resetTarget.userId,
+        channel: 'email',
+        recipient: resetTarget.email,
+        subject: 'Ufuq Commerce Password Recovery Code',
+        textBody: `Your password reset verification code is: ${resetTarget.otpCode}. It expires in 15 minutes.`,
+      });
+    }
+
     res.json({
       success: true,
-      data: { message: 'If the email exists, password reset instructions have been queued.' },
+      data: { message: 'If the email exists, a 6-digit recovery code has been dispatched.' },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.post('/password/reset', async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const { email, code, new_password } = z
+      .object({
+        email: z.string().email(),
+        code: z.string().length(6),
+        new_password: z.string().min(8).max(128),
+      })
+      .parse(req.body);
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const now = Date.now();
+
+    const updatedUserId = await dbStore.withTransaction((db) => {
+      const user = db.users.find(
+        (u) => u.tenant_id === authReq.tenantId && u.email.toLowerCase() === normalizedEmail
+      );
+      if (!user) {
+        throw new AppError({ status: 400, code: 'INVALID_RESET_CODE', message: 'Invalid or expired recovery code.' });
+      }
+
+      const otp = [...db.otp_verifications]
+        .reverse()
+        .find(
+          (o) =>
+            o.tenant_id === authReq.tenantId &&
+            o.user_id === user.id &&
+            o.purpose === 'reset_password' &&
+            !o.verified_at
+        );
+
+      if (!otp || new Date(otp.expires_at).getTime() < now) {
+        throw new AppError({ status: 400, code: 'INVALID_RESET_CODE', message: 'Recovery code is invalid or expired.' });
+      }
+      if (otp.attempts >= 5) {
+        throw new AppError({ status: 429, code: 'OTP_LOCKED', message: 'Too many invalid attempts. Request a new code.' });
+      }
+
+      otp.attempts += 1;
+      if (otp.code_hash !== sha256(code)) {
+        throw new AppError({ status: 400, code: 'INVALID_RESET_CODE', message: 'Invalid 6-digit recovery code.' });
+      }
+
+      otp.verified_at = new Date().toISOString();
+      user.password_hash = hashPassword(new_password);
+      user.updated_at = new Date().toISOString();
+
+      // Revoke active sessions on password reset
+      db.user_sessions.forEach((s) => {
+        if (s.user_id === user.id && !s.revoked_at) {
+          s.revoked_at = new Date().toISOString();
+        }
+      });
+
+      return user.id;
+    });
+
+    await recordAuditLog({
+      tenantId: authReq.tenantId,
+      actorUserId: updatedUserId,
+      action: 'auth.password_reset',
+      entityType: 'users',
+      entityId: updatedUserId,
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, data: { reset: true } });
   } catch (err) {
     next(err);
   }
@@ -643,31 +712,44 @@ authRouter.patch('/preferences', requireAuth, async (req, res, next) => {
   }
 });
 
-authRouter.get('/sidebar', requireAuth, (req, res) => {
-  const authReq = req as AuthRequest;
-  const user = authReq.authUser!;
-  const db = dbStore.snapshot();
+authRouter.get('/sidebar', requireAuth, (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const user = authReq.authUser!;
+    const db = dbStore.snapshot();
 
-  const scopeMap: Record<string, string> = {
-    super_admin: 'admin',
-    moderator: 'moderator',
-    staff: 'staff',
-    vendor: 'vendor',
-    customer: 'customer',
-  };
-  const requestedScope = (req.query.scope as string) || scopeMap[user.user_type] || 'customer';
+    const scopeMap: Record<string, string> = {
+      super_admin: 'admin',
+      moderator: 'moderator',
+      staff: 'staff',
+      vendor: 'vendor',
+      customer: 'customer',
+    };
+    const nativeScope = scopeMap[user.user_type] || 'customer';
+    const requestedScope = (req.query.scope as string) || nativeScope;
 
-  const items = db.sidebar_menus
-    .filter(
-      (m) =>
-        m.tenant_id === authReq.tenantId &&
-        m.dashboard_scope === requestedScope &&
-        m.is_active &&
-        (user.user_type === 'super_admin' || user.permissions.includes(m.required_permission))
-    )
-    .sort((a, b) => a.sort_order - b.sort_order);
+    if (user.user_type !== 'super_admin' && requestedScope !== nativeScope) {
+      throw new AppError({
+        status: 403,
+        code: 'FORBIDDEN',
+        message: `Role ${user.user_type} cannot access ${requestedScope} navigation scope`,
+      });
+    }
 
-  res.json({ success: true, data: { scope: requestedScope, items } });
+    const items = db.sidebar_menus
+      .filter(
+        (m) =>
+          m.tenant_id === authReq.tenantId &&
+          m.dashboard_scope === requestedScope &&
+          m.is_active &&
+          (user.user_type === 'super_admin' || user.permissions.includes(m.required_permission))
+      )
+      .sort((a, b) => a.sort_order - b.sort_order);
+
+    res.json({ success: true, data: { scope: requestedScope, items } });
+  } catch (err) {
+    next(err);
+  }
 });
 
 authRouter.get('/sessions', requireAuth, (req, res) => {
@@ -774,6 +856,159 @@ authRouter.post('/gdpr/erase', requireAuth, async (req, res, next) => {
     });
 
     res.json({ success: true, data: { anonymized: true } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+export interface SavedAddressItem {
+  id: string;
+  label: string;
+  full_name: string;
+  phone: string;
+  city: string;
+  street: string;
+  postal_code: string;
+  is_default: boolean;
+}
+
+const addressInputSchema = z.object({
+  label: z.string().min(1).max(60).default('المنزل / Home'),
+  full_name: z.string().min(2).max(120),
+  phone: z.string().min(7).max(30),
+  city: z.string().min(2).max(100),
+  street: z.string().min(3).max(200),
+  postal_code: z.string().min(3).max(20),
+  is_default: z.boolean().optional().default(false),
+});
+
+function readCustomerAddresses(db: ReturnType<typeof dbStore.snapshot>, tenantId: string, userId: string): SavedAddressItem[] {
+  const key = `customer_addresses:${userId}`;
+  const setting = db.system_settings.find(
+    (s) => s.tenant_id === tenantId && s.setting_group === 'general' && s.setting_key === key
+  );
+  if (setting && Array.isArray(setting.setting_value)) {
+    return setting.setting_value as SavedAddressItem[];
+  }
+  const latestOrder = db.orders.find((o) => o.tenant_id === tenantId && o.customer_id === userId);
+  if (latestOrder?.shipping_address) {
+    return [
+      {
+        id: `addr-${latestOrder.id}`,
+        label: 'العنوان الافتراضي | Primary',
+        full_name: latestOrder.shipping_address.full_name,
+        phone: latestOrder.shipping_address.phone,
+        city: latestOrder.shipping_address.city,
+        street: latestOrder.shipping_address.street,
+        postal_code: latestOrder.shipping_address.postal_code,
+        is_default: true,
+      },
+    ];
+  }
+  return [];
+}
+
+function writeCustomerAddresses(
+  db: ReturnType<typeof dbStore.snapshot>,
+  tenantId: string,
+  userId: string,
+  addresses: SavedAddressItem[]
+): void {
+  const key = `customer_addresses:${userId}`;
+  const nowIso = new Date().toISOString();
+  const existing = db.system_settings.find(
+    (s) => s.tenant_id === tenantId && s.setting_group === 'general' && s.setting_key === key
+  );
+  if (existing) {
+    existing.setting_value = addresses;
+    existing.updated_by = userId;
+    existing.updated_at = nowIso;
+  } else {
+    db.system_settings.push({
+      id: crypto.randomUUID(),
+      tenant_id: tenantId,
+      setting_group: 'general',
+      setting_key: key,
+      setting_value: addresses,
+      is_public: false,
+      updated_by: userId,
+      updated_at: nowIso,
+    });
+  }
+}
+
+authRouter.get('/addresses', requireAuth, (req, res) => {
+  const authReq = req as AuthRequest;
+  const db = dbStore.snapshot();
+  const addresses = readCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id);
+  res.json({ success: true, data: { addresses } });
+});
+
+authRouter.post('/addresses', requireAuth, async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const parsed = addressInputSchema.parse(req.body);
+    const addresses = await dbStore.withTransaction((db) => {
+      const current = readCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id);
+      const makeDefault = parsed.is_default || current.length === 0;
+      const nextList = current.map((a) => (makeDefault ? { ...a, is_default: false } : a));
+      nextList.push({
+        id: crypto.randomUUID(),
+        label: parsed.label,
+        full_name: parsed.full_name,
+        phone: parsed.phone,
+        city: parsed.city,
+        street: parsed.street,
+        postal_code: parsed.postal_code,
+        is_default: makeDefault,
+      });
+      writeCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id, nextList);
+      return nextList;
+    });
+    res.status(201).json({ success: true, data: { addresses } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.patch('/addresses/:id', requireAuth, async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const parsed = addressInputSchema.partial().parse(req.body);
+    const addresses = await dbStore.withTransaction((db) => {
+      const current = readCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id);
+      const idx = current.findIndex((a) => a.id === req.params.id);
+      if (idx === -1) {
+        throw new AppError({ status: 404, code: 'ADDRESS_NOT_FOUND', message: 'Shipping address not found' });
+      }
+      const nextList = current.map((a, i) => {
+        if (i === idx) {
+          return { ...a, ...parsed };
+        }
+        return parsed.is_default ? { ...a, is_default: false } : a;
+      });
+      writeCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id, nextList);
+      return nextList;
+    });
+    res.json({ success: true, data: { addresses } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.delete('/addresses/:id', requireAuth, async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const addresses = await dbStore.withTransaction((db) => {
+      const current = readCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id);
+      const filtered = current.filter((a) => a.id !== req.params.id);
+      if (filtered.length > 0 && !filtered.some((a) => a.is_default)) {
+        filtered[0] = { ...filtered[0], is_default: true };
+      }
+      writeCustomerAddresses(db, authReq.tenantId, authReq.authUser!.id, filtered);
+      return filtered;
+    });
+    res.json({ success: true, data: { addresses } });
   } catch (err) {
     next(err);
   }

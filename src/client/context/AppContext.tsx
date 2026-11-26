@@ -234,6 +234,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     refreshCart();
   }, [tenantId, refreshBootstrap, refreshAuthStatus, refreshCart]);
 
+  // Real Google Analytics 4 (gtag.js) script loading & SPA page_view tracking
+  useEffect(() => {
+    const gaId = bootstrap?.settings?.['analytics.ga4_measurement_id'];
+    const gaEnabled = bootstrap?.settings?.['feature_flags.enable_ga4'] !== false;
+    if (!gaEnabled || gdprConsent !== 'all' || typeof gaId !== 'string' || !/^G-[A-Z0-9]{6,}$/i.test(gaId)) {
+      return;
+    }
+    const win = window as Window & {
+      dataLayer?: unknown[];
+      gtag?: (...args: unknown[]) => void;
+    };
+    const scriptId = 'ufuq-ga4-script';
+    if (!document.getElementById(scriptId)) {
+      win.dataLayer = win.dataLayer || [];
+      win.gtag = function gtag(...args: unknown[]) {
+        win.dataLayer!.push(args);
+      };
+      win.gtag('js', new Date());
+      win.gtag('config', gaId, { send_page_view: false });
+
+      const s = document.createElement('script');
+      s.id = scriptId;
+      s.async = true;
+      s.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(gaId)}`;
+      document.head.appendChild(s);
+    }
+    if (typeof win.gtag === 'function') {
+      win.gtag('event', 'page_view', {
+        page_path: `${route}${searchQuery}`,
+        page_title: document.title,
+      });
+    }
+  }, [bootstrap, gdprConsent, route, searchQuery]);
+
   const switchTenant = useCallback(
     (id: string) => {
       setApiTenantId(id);

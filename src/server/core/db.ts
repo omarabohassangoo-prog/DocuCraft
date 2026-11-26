@@ -2,6 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { Pool } from 'pg';
 import { createInitialSeed } from './seed.ts';
+import {
+  ensureNormalizedPgSchema,
+  loadAllNormalizedTables,
+  persistAllNormalizedTables,
+} from './pg-relational.ts';
 import type { DatabaseSchema } from '../../shared/types.ts';
 
 function resolveDataDir(): string {
@@ -19,6 +24,7 @@ class PersistentRelationalStore {
   private writeQueue: Promise<void> = Promise.resolve();
   private lockQueue: Promise<void> = Promise.resolve();
   private pool: Pool | null = null;
+  private readPool: Pool | null = null;
   private pgInitialized = false;
   private pgInitPromise: Promise<void> | null = null;
   private lastPgSyncAt = 0;
@@ -27,18 +33,28 @@ class PersistentRelationalStore {
     if (process.env.DATABASE_URL) {
       this.pool = new Pool({
         connectionString: process.env.DATABASE_URL,
-        max: 5,
+        max: 10,
         ssl:
           process.env.DATABASE_URL.includes('localhost') ||
           process.env.DATABASE_URL.includes('127.0.0.1')
             ? undefined
             : { rejectUnauthorized: false },
       });
+      if (process.env.DATABASE_READ_REPLICA_URL) {
+        this.readPool = new Pool({
+          connectionString: process.env.DATABASE_READ_REPLICA_URL,
+          max: 10,
+          ssl:
+            process.env.DATABASE_READ_REPLICA_URL.includes('localhost') ||
+            process.env.DATABASE_READ_REPLICA_URL.includes('127.0.0.1')
+              ? undefined
+              : { rejectUnauthorized: false },
+        });
+      }
       this.data = createInitialSeed();
       return;
     }
 
-    // Local / Docker / Vercel /tmp fallback when DATABASE_URL is not configured
     try {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -59,6 +75,10 @@ class PersistentRelationalStore {
     return Boolean(this.pool);
   }
 
+  public hasReadReplica(): boolean {
+    return Boolean(this.readPool);
+  }
+
   public async ensureReady(forceRefresh = false): Promise<void> {
     if (!this.pool) return;
 
@@ -72,45 +92,39 @@ class PersistentRelationalStore {
       return;
     }
 
-    // Keep multi-instance Vercel serverless functions synchronized
     const now = Date.now();
     if (forceRefresh || now - this.lastPgSyncAt > 1500) {
-      const res = await this.pool.query<{ schema_json: DatabaseSchema }>(
-        'SELECT schema_json FROM ufuq_app_state WHERE id = 1'
-      );
-      if (res.rows[0]?.schema_json) {
-        this.data = res.rows[0].schema_json;
+      const reader = this.readPool || this.pool;
+      const client = await reader.connect();
+      try {
+        const loaded = await loadAllNormalizedTables(client);
+        if (loaded) {
+          this.data = loaded;
+        }
+        this.lastPgSyncAt = Date.now();
+      } finally {
+        client.release();
       }
-      this.lastPgSyncAt = Date.now();
     }
   }
 
   private async initPostgres(): Promise<void> {
     if (!this.pool) return;
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS ufuq_app_state (
-        id INTEGER PRIMARY KEY,
-        schema_json JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const existing = await client.query<{ schema_json: DatabaseSchema }>(
-        'SELECT schema_json FROM ufuq_app_state WHERE id = 1 FOR UPDATE'
-      );
-      if (existing.rows.length === 0) {
+      await client.query('SELECT pg_advisory_xact_lock(7042026)');
+      await ensureNormalizedPgSchema(client);
+
+      const loaded = await loadAllNormalizedTables(client);
+      if (!loaded) {
         const initial = createInitialSeed();
-        await client.query(
-          'INSERT INTO ufuq_app_state (id, schema_json, updated_at) VALUES (1, $1::jsonb, NOW())',
-          [JSON.stringify(initial)]
-        );
+        await persistAllNormalizedTables(client, initial);
         this.data = initial;
       } else {
-        this.data = existing.rows[0].schema_json;
+        this.data = loaded;
       }
+
       await client.query('COMMIT');
       this.pgInitialized = true;
       this.lastPgSyncAt = Date.now();
@@ -155,24 +169,19 @@ class PersistentRelationalStore {
     return this.data;
   }
 
-  // Serialized ACID transaction lock (PostgreSQL row lock in production, mutex locally)
   public async withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
     if (this.pool) {
       await this.ensureReady(false);
       const client = await this.pool.connect();
       try {
         await client.query('BEGIN');
-        const row = await client.query<{ schema_json: DatabaseSchema }>(
-          'SELECT schema_json FROM ufuq_app_state WHERE id = 1 FOR UPDATE'
-        );
-        const workingDb = row.rows[0]?.schema_json || structuredClone(this.data);
-        const result = await fn(workingDb);
-        await client.query(
-          'UPDATE ufuq_app_state SET schema_json = $1::jsonb, updated_at = NOW() WHERE id = 1',
-          [JSON.stringify(workingDb)]
-        );
+        await client.query('SELECT pg_advisory_xact_lock(7042026)');
+        const fresh = (await loadAllNormalizedTables(client)) || structuredClone(this.data);
+        const before = structuredClone(fresh);
+        const result = await fn(fresh);
+        await persistAllNormalizedTables(client, fresh, before);
         await client.query('COMMIT');
-        this.data = workingDb;
+        this.data = fresh;
         this.lastPgSyncAt = Date.now();
         return result;
       } catch (err) {

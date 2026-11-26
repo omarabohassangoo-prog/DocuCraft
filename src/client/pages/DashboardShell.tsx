@@ -105,14 +105,22 @@ export const DashboardShell: React.FC = () => {
     customer: 'customer',
   };
 
+  const expectedScope = user ? scopeFromRole[user.user_type] || 'customer' : 'customer';
+
   useEffect(() => {
     if (!user) return;
     if (user.user_type === 'super_admin') setCanRolePreview(true);
-    const scope = scopeFromRole[user.user_type] || 'customer';
-    apiRequest<{ items: SidebarMenuRecord[] }>(`/auth/sidebar?scope=${scope}`)
+    apiRequest<{ items: SidebarMenuRecord[] }>(`/auth/sidebar?scope=${expectedScope}`)
       .then((res) => setSidebarItems(res.items || []))
       .catch(() => {});
-  }, [user]);
+  }, [user, expectedScope]);
+
+  useEffect(() => {
+    if (!user) return;
+    if (route === '/dashboard' || !route.startsWith(`/dashboard/${expectedScope}`)) {
+      navigate(`/dashboard/${expectedScope}`);
+    }
+  }, [user, route, expectedScope, navigate]);
 
   if (!user) {
     return (
@@ -141,7 +149,7 @@ export const DashboardShell: React.FC = () => {
   }
 
   const renderMainContent = () => {
-    if (route.startsWith('/dashboard/admin')) {
+    if (expectedScope === 'admin') {
       if (route === '/dashboard/admin/vendors') return <AdvancedDataTable resource="vendors" />;
       if (route === '/dashboard/admin/products') return <AdvancedDataTable resource="products" />;
       if (route === '/dashboard/admin/orders') return <AdvancedDataTable resource="vendor_suborders" />;
@@ -161,9 +169,9 @@ export const DashboardShell: React.FC = () => {
       return <AdminOverviewView />;
     }
 
-    if (route.startsWith('/dashboard/moderator')) return <ModeratorDashboardView subpath={route} />;
-    if (route.startsWith('/dashboard/staff')) return <StaffDashboardView subpath={route} />;
-    if (route.startsWith('/dashboard/vendor')) return <VendorDashboardView subpath={route} />;
+    if (expectedScope === 'moderator') return <ModeratorDashboardView subpath={route} />;
+    if (expectedScope === 'staff') return <StaffDashboardView subpath={route} />;
+    if (expectedScope === 'vendor') return <VendorDashboardView subpath={route} />;
     return <CustomerDashboardView subpath={route} />;
   };
 

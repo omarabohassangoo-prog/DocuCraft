@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { dbStore } from '../core/db.ts';
 import { cacheStore } from '../core/cache.ts';
 import { encryptSecret, maskSecret } from '../core/crypto.ts';
+import { resolveTenantSecret } from '../core/secrets.ts';
 import { AppError } from '../core/errors.ts';
 import {
   attachTenantAndAuth,
@@ -12,70 +13,245 @@ import {
   recordAuditLog,
   type AuthRequest,
 } from '../core/auth-guard.ts';
+import { pingPaymentGateway } from '../services/payments.service.ts';
+import { pingNotificationProvider } from '../services/notifications.service.ts';
+import { pingStorageProvider } from '../services/storage.service.ts';
 
 export const adminRouter = Router();
 adminRouter.use(attachTenantAndAuth);
 adminRouter.use(requireAuth);
 
-adminRouter.get('/dashboard/analytics', (req, res) => {
-  const authReq = req as AuthRequest;
-  const db = dbStore.snapshot();
-  const tid = authReq.tenantId;
-  const user = authReq.authUser!;
+const MONTH_NAMES = [
+  'يناير / Jan',
+  'فبراير / Feb',
+  'مارس / Mar',
+  'أبريل / Apr',
+  'مايو / May',
+  'يونيو / Jun',
+  'يوليو / Jul',
+  'أغسطس / Aug',
+  'سبتمبر / Sep',
+  'أكتوبر / Oct',
+  'نوفمبر / Nov',
+  'ديسمبر / Dec',
+];
 
-  const orders = db.orders.filter((o) => o.tenant_id === tid);
-  const suborders = db.vendor_suborders.filter((s) => {
-    if (s.tenant_id !== tid) return false;
-    if (user.user_type === 'vendor' && user.vendor_id) return s.vendor_id === user.vendor_id;
-    return true;
-  });
+adminRouter.get('/dashboard/analytics', (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const db = dbStore.snapshot();
+    const tid = authReq.tenantId;
+    const user = authReq.authUser!;
 
-  const grossRevenue = suborders.reduce((acc, s) => acc + s.gross_amount, 0);
-  const platformCommission = suborders.reduce((acc, s) => acc + s.commission_amount, 0);
-  const vendorNet = suborders.reduce((acc, s) => acc + s.vendor_net_amount, 0);
-  const activeVendors = db.vendors.filter((v) => v.tenant_id === tid && v.is_active).length;
-  const activeProducts = db.products.filter((p) => {
-    if (p.tenant_id !== tid || p.deleted_at) return false;
-    if (user.user_type === 'vendor' && user.vendor_id) return p.vendor_id === user.vendor_id;
-    return true;
-  }).length;
-  const lowStockVariants = db.product_variants.filter((v) => {
-    if (v.tenant_id !== tid) return false;
-    if (user.user_type === 'vendor' && user.vendor_id) {
-      const prod = db.products.find((p) => p.id === v.product_id);
-      if (!prod || prod.vendor_id !== user.vendor_id) return false;
+    if (!['super_admin', 'vendor'].includes(user.user_type)) {
+      throw new AppError({
+        status: 403,
+        code: 'FORBIDDEN',
+        message: 'Financial analytics are restricted to Super Admin and Vendor workspaces',
+      });
     }
-    return v.stock_qty <= v.low_stock_threshold;
-  });
 
-  const monthlySeries = [
-    { month: 'يناير / Jan', revenue: 18400, commission: 1840, orders: 42 },
-    { month: 'فبراير / Feb', revenue: 23900, commission: 2390, orders: 58 },
-    { month: 'مارس / Mar', revenue: 31200, commission: 3120, orders: 74 },
-    { month: 'أبريل / Apr', revenue: 28700, commission: 2870, orders: 69 },
-    { month: 'مايو / May', revenue: 39400, commission: 3940, orders: 91 },
-    { month: 'يونيو / Jun', revenue: Math.round(42000 + grossRevenue), commission: Math.round(4200 + platformCommission), orders: 98 + orders.length },
-  ];
+    const ownedVendorIds = new Set(
+      db.vendors
+        .filter((v) => v.tenant_id === tid && v.owner_user_id === user.id)
+        .map((v) => v.id)
+    );
+    if (user.vendor_id) ownedVendorIds.add(user.vendor_id);
+    const isVendor = user.user_type === 'vendor';
 
-  res.json({
-    success: true,
-    data: {
-      kpis: {
-        grossRevenue,
-        platformCommission,
-        vendorNet,
-        totalOrders: orders.length,
-        suborderCount: suborders.length,
-        activeVendors,
-        activeProducts,
-        lowStockCount: lowStockVariants.length,
-        pendingVendors: db.vendors.filter((v) => v.tenant_id === tid && v.kyc_status === 'pending').length,
-        openInquiries: db.contact_inquiries.filter((c) => c.tenant_id === tid && c.status !== 'resolved').length,
+    const orders = db.orders.filter((o) => o.tenant_id === tid);
+    const orderMap = new Map(orders.map((o) => [o.id, o]));
+
+    const suborders = db.vendor_suborders.filter((s) => {
+      if (s.tenant_id !== tid) return false;
+      if (isVendor) return ownedVendorIds.has(s.vendor_id);
+      return true;
+    });
+
+    const grossRevenue = suborders.reduce((acc, s) => acc + s.gross_amount, 0);
+    const platformCommission = suborders.reduce((acc, s) => acc + s.commission_amount, 0);
+    const vendorNet = suborders.reduce((acc, s) => acc + s.vendor_net_amount, 0);
+    const activeVendors = isVendor
+      ? db.vendors.filter((v) => v.tenant_id === tid && ownedVendorIds.has(v.id) && v.is_active).length
+      : db.vendors.filter((v) => v.tenant_id === tid && v.is_active).length;
+    const activeProducts = db.products.filter((p) => {
+      if (p.tenant_id !== tid || p.deleted_at) return false;
+      if (isVendor) return ownedVendorIds.has(p.vendor_id);
+      return true;
+    }).length;
+    const lowStockVariants = db.product_variants.filter((v) => {
+      if (v.tenant_id !== tid) return false;
+      if (isVendor) {
+        const prod = db.products.find((p) => p.id === v.product_id);
+        if (!prod || !ownedVendorIds.has(prod.vendor_id)) return false;
+      }
+      return v.stock_qty <= v.low_stock_threshold;
+    });
+
+    const now = new Date();
+    const buckets = new Map<string, { month: string; revenue: number; commission: number; orders: number }>();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      buckets.set(key, { month: MONTH_NAMES[d.getMonth()], revenue: 0, commission: 0, orders: 0 });
+    }
+
+    const countedOrdersPerBucket = new Set<string>();
+    for (const s of suborders) {
+      const parentOrder = orderMap.get(s.order_id);
+      const createdAt = parentOrder?.created_at || s.updated_at;
+      const d = new Date(createdAt);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const bucket = buckets.get(key);
+      if (bucket) {
+        bucket.revenue = Number((bucket.revenue + s.gross_amount).toFixed(2));
+        bucket.commission = Number((bucket.commission + s.commission_amount).toFixed(2));
+        const orderBucketKey = `${key}:${s.order_id}`;
+        if (!countedOrdersPerBucket.has(orderBucketKey)) {
+          countedOrdersPerBucket.add(orderBucketKey);
+          bucket.orders += 1;
+        }
+      }
+    }
+
+    const monthlySeries = Array.from(buckets.values());
+    const vendorDistinctOrders = new Set(suborders.map((s) => s.order_id)).size;
+
+    res.json({
+      success: true,
+      data: {
+        kpis: {
+          grossRevenue,
+          platformCommission,
+          vendorNet,
+          totalOrders: isVendor ? vendorDistinctOrders : orders.length,
+          suborderCount: suborders.length,
+          activeVendors,
+          activeProducts,
+          lowStockCount: lowStockVariants.length,
+          pendingVendors: isVendor ? 0 : db.vendors.filter((v) => v.tenant_id === tid && v.kyc_status === 'pending').length,
+          openInquiries: isVendor ? 0 : db.contact_inquiries.filter((c) => c.tenant_id === tid && c.status !== 'resolved').length,
+        },
+        lowStockVariants,
+        monthlySeries,
       },
-      lowStockVariants,
-      monthlySeries,
-    },
-  });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Operational workspace summary for Moderator & Staff (no sensitive platform financial ledger)
+adminRouter.get('/workspace/summary', (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const user = authReq.authUser!;
+    if (!['super_admin', 'moderator', 'staff'].includes(user.user_type)) {
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Access denied to workspace summary' });
+    }
+    const db = dbStore.snapshot();
+    const tid = authReq.tenantId;
+
+    const pendingVendors = db.vendors.filter((v) => v.tenant_id === tid && v.kyc_status === 'pending').length;
+    const verifiedVendors = db.vendors.filter((v) => v.tenant_id === tid && v.kyc_status === 'verified').length;
+    const activeProducts = db.products.filter((p) => p.tenant_id === tid && !p.deleted_at && p.status === 'active').length;
+    const draftProducts = db.products.filter((p) => p.tenant_id === tid && !p.deleted_at && p.status !== 'active').length;
+    const openInquiries = db.contact_inquiries.filter((c) => c.tenant_id === tid && c.status !== 'resolved').length;
+    const pendingSuborders = db.vendor_suborders.filter(
+      (s) => s.tenant_id === tid && ['pending', 'packed'].includes(s.fulfillment_status)
+    ).length;
+    const shippedSuborders = db.vendor_suborders.filter(
+      (s) => s.tenant_id === tid && ['shipped', 'delivered'].includes(s.fulfillment_status)
+    ).length;
+
+    res.json({
+      success: true,
+      data: {
+        pendingVendors,
+        verifiedVendors,
+        activeProducts,
+        draftProducts,
+        openInquiries,
+        pendingSuborders,
+        shippedSuborders,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Vendor Store Settings (Read & Update owned vendor storefronts)
+adminRouter.get('/vendor/store-settings', (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const user = authReq.authUser!;
+    if (!['super_admin', 'vendor'].includes(user.user_type)) {
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Vendor workspace only' });
+    }
+    const db = dbStore.snapshot();
+    const stores = db.vendors.filter(
+      (v) => v.tenant_id === authReq.tenantId && (user.user_type === 'super_admin' || v.owner_user_id === user.id || v.id === user.vendor_id)
+    );
+    res.json({ success: true, data: { stores } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.patch('/vendor/store-settings', async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const user = authReq.authUser!;
+    if (!['super_admin', 'vendor'].includes(user.user_type)) {
+      throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Vendor workspace only' });
+    }
+    const parsed = z
+      .object({
+        vendor_id: z.string().min(1),
+        store_name_ar: z.string().min(2).max(120),
+        store_name_en: z.string().min(2).max(120),
+        tagline_ar: z.string().max(240).optional().default(''),
+        tagline_en: z.string().max(240).optional().default(''),
+        commercial_reg_no: z.string().max(80).nullable().optional(),
+        logo_file_id: z.string().nullable().optional(),
+      })
+      .parse(req.body);
+
+    const updated = await dbStore.withTransaction((db) => {
+      const vendor = db.vendors.find((v) => v.id === parsed.vendor_id && v.tenant_id === authReq.tenantId);
+      if (!vendor) {
+        throw new AppError({ status: 404, code: 'VENDOR_NOT_FOUND', message: 'Vendor store not found' });
+      }
+      if (user.user_type === 'vendor' && vendor.owner_user_id !== user.id && vendor.id !== user.vendor_id) {
+        throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Cannot edit another vendor storefront' });
+      }
+      vendor.store_name_i18n = { ar: parsed.store_name_ar.trim(), en: parsed.store_name_en.trim() };
+      vendor.tagline_i18n = { ar: parsed.tagline_ar.trim(), en: parsed.tagline_en.trim() };
+      if (parsed.commercial_reg_no !== undefined) {
+        vendor.commercial_reg_no = parsed.commercial_reg_no ? parsed.commercial_reg_no.trim() : null;
+      }
+      if (parsed.logo_file_id !== undefined) {
+        vendor.logo_file_id = parsed.logo_file_id;
+      }
+      return vendor;
+    });
+
+    cacheStore.invalidatePrefix(cacheStore.key(authReq.tenantId, ''));
+    await recordAuditLog({
+      tenantId: authReq.tenantId,
+      actorUserId: user.id,
+      action: 'vendor.settings_updated',
+      entityType: 'vendors',
+      entityId: updated.id,
+      newValues: { store_name_i18n: updated.store_name_i18n },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, data: { store: updated } });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // System Settings & SEO
@@ -213,10 +389,10 @@ adminRouter.get('/env-secrets', requirePermission('system.settings.manage'), (re
     }));
 
   const envConfiguredKeys = [
-    { service_name: 'paypal', env_key: 'PAYPAL_CLIENT_ID', configured_in_env: Boolean(process.env.PAYPAL_CLIENT_ID) },
     { service_name: 'stripe', env_key: 'STRIPE_SECRET_KEY', configured_in_env: Boolean(process.env.STRIPE_SECRET_KEY) },
+    { service_name: 'paypal', env_key: 'PAYPAL_CLIENT_ID', configured_in_env: Boolean(process.env.PAYPAL_CLIENT_ID) },
     { service_name: 'mada_tap', env_key: 'TAP_SECRET_KEY', configured_in_env: Boolean(process.env.TAP_SECRET_KEY) },
-    { service_name: 'email', env_key: 'RESEND_API_KEY', configured_in_env: Boolean(process.env.RESEND_API_KEY) },
+    { service_name: 'email', env_key: 'RESEND_API_KEY', configured_in_env: Boolean(process.env.RESEND_API_KEY || process.env.SENDGRID_API_KEY) },
     { service_name: 'sms', env_key: 'TWILIO_AUTH_TOKEN', configured_in_env: Boolean(process.env.TWILIO_AUTH_TOKEN) },
     { service_name: 'whatsapp', env_key: 'WHATSAPP_ACCESS_TOKEN', configured_in_env: Boolean(process.env.WHATSAPP_ACCESS_TOKEN) },
     { service_name: 'storage', env_key: 'STORAGE_ACCESS_KEY_ID', configured_in_env: Boolean(process.env.STORAGE_ACCESS_KEY_ID) },
@@ -298,33 +474,50 @@ adminRouter.post('/env-secrets', requirePermission('system.settings.manage'), as
   }
 });
 
-adminRouter.post('/env-secrets/test-connection', requirePermission('system.settings.manage'), (req, res) => {
-  const authReq = req as AuthRequest;
-  const { service_name } = z.object({ service_name: z.string().min(1) }).parse(req.body);
-  const db = dbStore.snapshot();
-  const hasVaultKey = db.encrypted_secrets.some(
-    (s) => s.tenant_id === authReq.tenantId && s.service_name === service_name
-  );
-  const envKeyMap: Record<string, string | undefined> = {
-    paypal: process.env.PAYPAL_CLIENT_ID,
-    stripe: process.env.STRIPE_SECRET_KEY,
-    mada_tap: process.env.TAP_SECRET_KEY,
-    email: process.env.RESEND_API_KEY || process.env.SENDGRID_API_KEY,
-    sms: process.env.TWILIO_AUTH_TOKEN || process.env.UNIFONIC_APP_SID,
-    whatsapp: process.env.WHATSAPP_ACCESS_TOKEN,
-    storage: process.env.STORAGE_ACCESS_KEY_ID,
-  };
-  const hasEnvKey = Boolean(envKeyMap[service_name]);
-  res.json({
-    success: true,
-    data: {
-      service_name,
-      configured: hasVaultKey || hasEnvKey,
-      source: hasVaultKey ? 'encrypted_vault_aes256gcm' : hasEnvKey ? 'process_env' : 'sandbox_simulation',
-      status: hasVaultKey || hasEnvKey ? 'verified' : 'sandbox_ready',
-      checked_at: new Date().toISOString(),
-    },
-  });
+// Real Live HTTP Ping against external service providers
+adminRouter.post('/env-secrets/test-connection', requirePermission('system.settings.manage'), async (req, res, next) => {
+  try {
+    const authReq = req as AuthRequest;
+    const { service_name } = z.object({ service_name: z.string().min(1) }).parse(req.body);
+    const db = dbStore.snapshot();
+
+    let result: {
+      configured: boolean;
+      status: 'verified' | 'auth_failed' | 'not_configured';
+      message: string;
+      latency_ms: number;
+    };
+
+    if (service_name === 'stripe' || service_name === 'paypal' || service_name === 'mada_tap') {
+      result = await pingPaymentGateway(db, authReq.tenantId, service_name);
+    } else if (service_name === 'email' || service_name === 'sms' || service_name === 'whatsapp') {
+      result = await pingNotificationProvider(db, authReq.tenantId, service_name);
+    } else if (service_name === 'storage') {
+      result = await pingStorageProvider(db, authReq.tenantId);
+    } else {
+      const hasAny = Boolean(resolveTenantSecret(db, authReq.tenantId, service_name));
+      result = {
+        configured: hasAny,
+        status: hasAny ? 'verified' : 'not_configured',
+        message: hasAny ? 'Secret key present in server vault/env' : 'Not configured',
+        latency_ms: 0,
+      };
+    }
+
+    res.json({
+      success: true,
+      data: {
+        service_name,
+        configured: result.configured,
+        status: result.status,
+        message: result.message,
+        latency_ms: result.latency_ms,
+        checked_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // CMS Page & Section Editor
