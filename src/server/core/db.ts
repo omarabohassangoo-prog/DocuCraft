@@ -30,25 +30,33 @@ class PersistentRelationalStore {
   private lastPgSyncAt = 0;
 
   constructor() {
-    if (process.env.DATABASE_URL) {
+    const configuredDatabaseUrl =
+      process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
+
+    if (configuredDatabaseUrl) {
+      const databaseUrl = new URL(configuredDatabaseUrl);
+      databaseUrl.searchParams.delete('sslmode');
+      const connectionString = databaseUrl.toString();
+      const isLocalDatabase =
+        connectionString.includes('localhost') || connectionString.includes('127.0.0.1');
+
       this.pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+        connectionString,
         max: 10,
-        ssl:
-          process.env.DATABASE_URL.includes('localhost') ||
-          process.env.DATABASE_URL.includes('127.0.0.1')
-            ? undefined
-            : { rejectUnauthorized: false },
+        ssl: isLocalDatabase ? undefined : { rejectUnauthorized: false },
       });
       if (process.env.DATABASE_READ_REPLICA_URL) {
+        const readReplicaUrl = new URL(process.env.DATABASE_READ_REPLICA_URL);
+        readReplicaUrl.searchParams.delete('sslmode');
+        const readReplicaConnectionString = readReplicaUrl.toString();
+        const isLocalReadReplica =
+          readReplicaConnectionString.includes('localhost') ||
+          readReplicaConnectionString.includes('127.0.0.1');
+
         this.readPool = new Pool({
-          connectionString: process.env.DATABASE_READ_REPLICA_URL,
+          connectionString: readReplicaConnectionString,
           max: 10,
-          ssl:
-            process.env.DATABASE_READ_REPLICA_URL.includes('localhost') ||
-            process.env.DATABASE_READ_REPLICA_URL.includes('127.0.0.1')
-              ? undefined
-              : { rejectUnauthorized: false },
+          ssl: isLocalReadReplica ? undefined : { rejectUnauthorized: false },
         });
       }
       this.data = createInitialSeed();

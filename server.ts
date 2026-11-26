@@ -1,10 +1,16 @@
+import dotenv from 'dotenv';
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
-import { createApiApp } from './src/server/app.ts';
-import { dbStore } from './src/server/core/db.ts';
+
+dotenv.config({ path: path.resolve(process.cwd(), '.env.development.local') });
 
 async function startServer() {
+  const [{ createServer: createViteServer }, { createApiApp }, { dbStore }] = await Promise.all([
+    import('vite'),
+    import('./src/server/app.ts'),
+    import('./src/server/core/db.ts'),
+  ]);
+
   await dbStore.ensureReady().catch((err) => {
     console.warn('Database initialization notice:', err instanceof Error ? err.message : err);
   });
