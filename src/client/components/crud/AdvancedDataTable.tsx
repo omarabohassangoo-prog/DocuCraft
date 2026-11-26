@@ -47,6 +47,10 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
   const { locale, notify } = useApp();
   const [schema, setSchema] = useState<CrudResourceMetadata | null>(null);
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
+  const [schemaLoadError, setSchemaLoadError] = useState(false);
+  const [rowsLoadError, setRowsLoadError] = useState(false);
+  const [schemaRetry, setSchemaRetry] = useState(0);
+  const [exporting, setExporting] = useState(false);
   const [pagination, setPagination] = useState({
     limit: 10,
     current_page: 1,
@@ -83,18 +87,28 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
   useEffect(() => {
     setPage(1);
     setStatusFilter(initialStatusFilter);
+    setSchema(null);
+    setRows([]);
+    setSchemaLoadError(false);
+    setLoading(true);
     apiRequest<CrudResourceMetadata>(`/crud/${resource}/schema`)
       .then((res) => {
         setSchema(res);
         setSortBy(res.default_sort.field);
         setSortOrder(res.default_sort.order);
+        setHiddenCols({});
       })
-      .catch((err) => notify(err.message, 'error'));
-  }, [resource, initialStatusFilter, notify]);
+      .catch((err) => {
+        setSchemaLoadError(true);
+        setLoading(false);
+        notify(err.message, 'error');
+      });
+  }, [resource, initialStatusFilter, notify, schemaRetry]);
 
   const fetchRows = useCallback(async () => {
-    if (!schema) return;
+    if (!schema || schema.resource !== resource) return;
     setLoading(true);
+    setRowsLoadError(false);
     try {
       const qs = new URLSearchParams({
         page: String(page),
@@ -109,6 +123,7 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
       setPagination(res.pagination);
       setExecMs(res.meta?.execution_ms ?? null);
     } catch (err) {
+      setRowsLoadError(true);
       notify(err instanceof Error ? err.message : 'Failed to load table data', 'error');
     } finally {
       setLoading(false);
@@ -150,10 +165,12 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
     if (fieldMeta.look_type === 'boolean_switch') {
       const checked = Boolean(raw);
       return (
-        <button
-          type="button"
-          disabled={!fieldMeta.inline_edit.enabled}
-          onClick={() => commitInlineEdit(rowId, fieldMeta.field, !checked)}
+          <button
+            type="button"
+            disabled={!fieldMeta.inline_edit.enabled}
+            aria-pressed={checked}
+            aria-label={`${t(locale, fieldMeta.label_key)}: ${checked ? (locale === 'ar' ? 'مفعل' : 'enabled') : (locale === 'ar' ? 'معطل' : 'disabled')}`}
+            onClick={() => commitInlineEdit(rowId, fieldMeta.field, !checked)}
           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
             checked ? 'bg-[var(--brand-primary)]' : 'bg-zinc-300 dark:bg-zinc-700'
           }`}
@@ -191,12 +208,15 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
 
       return (
         <div className="flex items-center gap-1">
-          <input
-            type={fieldMeta.inline_edit.input_type === 'number' ? 'number' : 'text'}
-            value={editValue}
+            <input
+              type={fieldMeta.inline_edit.input_type === 'number' ? 'number' : 'text'}
+              aria-label={t(locale, fieldMeta.label_key)}
+              value={editValue}
             onChange={(e) => setEditValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') commitInlineEdit(rowId, fieldMeta.field, editValue);
+              if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                commitInlineEdit(rowId, fieldMeta.field, editValue);
+              }
               if (e.key === 'Escape') setEditingCell(null);
             }}
             className="w-28 rounded border border-[var(--brand-primary)] bg-[var(--surface-canvas)] px-2 py-1 text-xs tabular-nums"
@@ -295,10 +315,21 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
     );
   };
 
+  if (schemaLoadError) {
+    return (
+      <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-6 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+        <p>{locale === 'ar' ? 'تعذر تحميل إعدادات الجدول.' : 'Could not load table configuration.'}</p>
+        <button type="button" onClick={() => setSchemaRetry((count) => count + 1)} className="mt-3 rounded-lg border border-current px-3 py-1.5 text-xs font-semibold">
+          {locale === 'ar' ? 'إعادة المحاولة' : 'Retry'}
+        </button>
+      </div>
+    );
+  }
+
   if (!schema) {
     return (
-      <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-8 text-center text-sm text-[var(--text-secondary)]">
-        {locale === 'ar' ? 'جاري تحميل الجدول...' : 'Loading data table...'}
+      <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-8 text-center text-sm text-[var(--text-secondary)]" aria-live="polite">
+        {locale === 'ar' ? 'جارٍ تحميل الجدول...' : 'Loading data table...'}
       </div>
     );
   }
@@ -308,18 +339,50 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
     (f) => f.look_type === 'badge' && f.capabilities.filterable && f.display_options.badge_map
   );
 
-  const handleExportCsv = () => {
-    const headers = visibleFields.map((f) => t(locale, f.label_key));
-    const exportData = rows.map((r) =>
-      visibleFields.map((f) => {
-        const val = r[f.field];
-        if (val && typeof val === 'object' && ('ar' in (val as object) || 'en' in (val as object))) {
-          return pickI18n(val as { ar: string; en: string }, locale);
+  const handleExportCsv = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const exportableFields = visibleFields.filter((field) => field.capabilities.exportable);
+      const headers = exportableFields.map((field) => t(locale, field.label_key));
+      const exportData: (string | number | boolean | null)[][] = [];
+      let currentPage = 1;
+      let totalPages = 1;
+      const maxExportRows = 20000;
+
+      do {
+        const qs = new URLSearchParams({
+          page: String(currentPage),
+          limit: '100',
+          search: debouncedSearch,
+          status: statusFilter,
+          sort_by: sortBy || schema.default_sort.field,
+          sort_order: sortOrder,
+        });
+        const response = await apiRawRequest<CrudListResponse>(`/crud/${resource}?${qs.toString()}`);
+        if (response.pagination.total_items > maxExportRows) {
+          notify(locale === 'ar' ? 'عدد النتائج كبير جدًا للتصدير. أضف مرشحًا ثم أعد المحاولة.' : 'Too many rows to export. Add a filter and try again.', 'error');
+          return;
         }
-        return val as string | number | boolean | null;
-      })
-    );
-    exportRowsToCsv(`${resource}-${new Date().toISOString().slice(0, 10)}.csv`, headers, exportData);
+        totalPages = response.pagination.total_pages;
+        for (const row of response.data) {
+          exportData.push(exportableFields.map((field) => {
+            const value = row[field.field];
+            if (value && typeof value === 'object' && ('ar' in value || 'en' in value)) {
+              return pickI18n(value as { ar: string; en: string }, locale);
+            }
+            return value as string | number | boolean | null;
+          }));
+        }
+        currentPage += 1;
+      } while (currentPage <= totalPages);
+
+      exportRowsToCsv(`${resource}-${new Date().toISOString().slice(0, 10)}.csv`, headers, exportData);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to export table data', 'error');
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -343,6 +406,7 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
             <Search className="pointer-events-none absolute top-1/2 -translate-y-1/2 start-2.5 h-3.5 w-3.5 text-[var(--text-secondary)]" />
             <input
               type="text"
+              aria-label={locale === 'ar' ? 'البحث في السجلات' : 'Search records'}
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               placeholder={locale === 'ar' ? 'بحث سريع...' : 'Quick search...'}
@@ -399,10 +463,11 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
           <button
             type="button"
             onClick={handleExportCsv}
-            className="flex items-center gap-1 rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)] hover:bg-[var(--surface-muted)]"
+            disabled={exporting}
+            className="flex items-center gap-1 rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)] hover:bg-[var(--surface-muted)] disabled:cursor-wait disabled:opacity-60"
           >
             <Download className="h-3.5 w-3.5" />
-            {t(locale, 'export_csv')}
+            {exporting ? (locale === 'ar' ? 'جارٍ التصدير...' : 'Exporting...') : t(locale, 'export_csv')}
           </button>
 
           <button
@@ -445,8 +510,17 @@ export const AdvancedDataTable: React.FC<AdvancedDataTableProps> = ({
           <tbody className="divide-y divide-[var(--border-hairline)]">
             {loading ? (
               <tr>
-                <td colSpan={visibleFields.length} className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">
-                  {locale === 'ar' ? 'جاري التحديث...' : 'Refreshing...'}
+                <td colSpan={visibleFields.length} className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]" aria-live="polite">
+                  {locale === 'ar' ? 'جارٍ التحديث...' : 'Refreshing...'}
+                </td>
+              </tr>
+            ) : rowsLoadError ? (
+              <tr>
+                <td colSpan={visibleFields.length} className="px-4 py-8 text-center text-sm text-red-700 dark:text-red-300" role="alert">
+                  <span>{locale === 'ar' ? 'تعذر تحميل السجلات.' : 'Could not load records.'}</span>
+                  <button type="button" onClick={fetchRows} className="ms-2 underline underline-offset-2">
+                    {locale === 'ar' ? 'إعادة المحاولة' : 'Retry'}
+                  </button>
                 </td>
               </tr>
             ) : rows.length === 0 ? (

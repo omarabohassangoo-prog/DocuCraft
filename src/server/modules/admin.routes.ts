@@ -67,15 +67,19 @@ adminRouter.get('/dashboard/analytics', (req, res, next) => {
       if (isVendor) return ownedVendorIds.has(s.vendor_id);
       return true;
     });
+    const paidSuborders = suborders.filter((suborder) => {
+      const order = orderMap.get(suborder.order_id);
+      return order?.payment_status === 'paid' && order.order_status !== 'cancelled';
+    });
 
-    const grossRevenue = suborders.reduce((acc, s) => acc + s.gross_amount, 0);
-    const platformCommission = suborders.reduce((acc, s) => acc + s.commission_amount, 0);
-    const vendorNet = suborders.reduce((acc, s) => acc + s.vendor_net_amount, 0);
+    const grossRevenue = paidSuborders.reduce((acc, s) => acc + s.gross_amount, 0);
+    const platformCommission = paidSuborders.reduce((acc, s) => acc + s.commission_amount, 0);
+    const vendorNet = paidSuborders.reduce((acc, s) => acc + s.vendor_net_amount, 0);
     const activeVendors = isVendor
       ? db.vendors.filter((v) => v.tenant_id === tid && ownedVendorIds.has(v.id) && v.is_active).length
       : db.vendors.filter((v) => v.tenant_id === tid && v.is_active).length;
     const activeProducts = db.products.filter((p) => {
-      if (p.tenant_id !== tid || p.deleted_at) return false;
+      if (p.tenant_id !== tid || p.deleted_at || p.status !== 'active') return false;
       if (isVendor) return ownedVendorIds.has(p.vendor_id);
       return true;
     }).length;
@@ -97,7 +101,7 @@ adminRouter.get('/dashboard/analytics', (req, res, next) => {
     }
 
     const countedOrdersPerBucket = new Set<string>();
-    for (const s of suborders) {
+    for (const s of paidSuborders) {
       const parentOrder = orderMap.get(s.order_id);
       const createdAt = parentOrder?.created_at || s.updated_at;
       const d = new Date(createdAt);
@@ -115,7 +119,7 @@ adminRouter.get('/dashboard/analytics', (req, res, next) => {
     }
 
     const monthlySeries = Array.from(buckets.values());
-    const vendorDistinctOrders = new Set(suborders.map((s) => s.order_id)).size;
+    const paidDistinctOrders = new Set(paidSuborders.map((s) => s.order_id)).size;
 
     res.json({
       success: true,
@@ -124,8 +128,8 @@ adminRouter.get('/dashboard/analytics', (req, res, next) => {
           grossRevenue,
           platformCommission,
           vendorNet,
-          totalOrders: isVendor ? vendorDistinctOrders : orders.length,
-          suborderCount: suborders.length,
+          totalOrders: paidDistinctOrders,
+          suborderCount: paidSuborders.length,
           activeVendors,
           activeProducts,
           lowStockCount: lowStockVariants.length,
@@ -279,6 +283,25 @@ adminRouter.put('/settings', requirePermission('system.settings.manage'), async 
       })
       .parse(req.body);
 
+    const invalidSetting = updates.find((update) => {
+      if (update.setting_group === 'ecommerce' && update.setting_key === 'vat_rate') {
+        return typeof update.setting_value !== 'number' || !Number.isFinite(update.setting_value) || update.setting_value < 0 || update.setting_value > 100;
+      }
+      if (update.setting_group === 'theme' && ['brand_primary_color', 'brand_accent_color'].includes(update.setting_key)) {
+        return typeof update.setting_value !== 'string' || !/^#[0-9a-f]{6}$/i.test(update.setting_value);
+      }
+      if (update.setting_group === 'analytics' && update.setting_key === 'ga4_measurement_id') {
+        return typeof update.setting_value !== 'string' || (update.setting_value !== '' && !/^G-[A-Z0-9]{6,}$/i.test(update.setting_value));
+      }
+      if (update.setting_group === 'seo' && update.setting_key === 'robots_txt') {
+        return typeof update.setting_value !== 'string' || update.setting_value.length > 10000;
+      }
+      return false;
+    });
+    if (invalidSetting) {
+      throw new AppError({ status: 400, code: 'INVALID_SETTING_VALUE', message: `Invalid value for ${invalidSetting.setting_key}` });
+    }
+
     await dbStore.withTransaction((db) => {
       const nowIso = new Date().toISOString();
       for (const u of updates) {
@@ -333,7 +356,7 @@ adminRouter.post('/adsense', requirePermission('seo.ads.manage'), async (req, re
       .object({
         id: z.string().optional(),
         name: z.string().min(2),
-        adsense_client_id: z.string().min(4),
+        adsense_client_id: z.string().regex(/^ca-pub-\d{16}$/),
         adsense_slot_id: z.string().min(4),
         placement: z.enum(['blog_sidebar', 'catalog_top', 'home_mid', 'article_middle']),
         ad_format: z.enum(['auto', 'rectangle', 'horizontal']).default('auto'),

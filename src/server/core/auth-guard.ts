@@ -71,7 +71,7 @@ export function attachTenantAndAuth(req: Request, _res: Response, next: NextFunc
         (s) => s.id === payload.sid && !s.revoked_at && new Date(s.expires_at).getTime() > Date.now()
       );
       if (user && session) {
-        authReq.tenantId = payload.tid;
+        authReq.tenantId = user.user_type === 'super_admin' && matchedTenant ? matchedTenant.id : payload.tid;
         authReq.authUser = toSafeUserDTO(user);
         authReq.sessionId = session.id;
       }

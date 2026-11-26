@@ -38,14 +38,24 @@ import { apiRequest } from '../lib/api.ts';
 import { useApp } from '../context/AppContext.tsx';
 import { pickI18n, t } from '../i18n/dictionary.ts';
 import { AdvancedDataTable } from '../components/crud/AdvancedDataTable.tsx';
-import {
-  AdminAuditAndLogsView,
-  AdminCmsEditorView,
-  AdminOverviewView,
-  AdminSeoAdsView,
-  AdminSettingsVaultView,
-  AdminUsersRbacView,
-} from './AdminViews.tsx';
+const AdminAuditAndLogsView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminAuditAndLogsView }))
+);
+const AdminCmsEditorView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminCmsEditorView }))
+);
+const AdminOverviewView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminOverviewView }))
+);
+const AdminSeoAdsView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminSeoAdsView }))
+);
+const AdminSettingsVaultView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminSettingsVaultView }))
+);
+const AdminUsersRbacView = React.lazy(() =>
+  import('./AdminViews.tsx').then((module) => ({ default: module.AdminUsersRbacView }))
+);
 import {
   CustomerDashboardView,
   ModeratorDashboardView,
@@ -90,12 +100,18 @@ export const DashboardShell: React.FC = () => {
     theme,
     setTheme,
     user,
+    bootstrap,
+    tenantId,
+    switchTenant,
     logout,
     switchRolePreview,
+    isRolePreview,
+    notify,
+    exitRolePreview,
   } = useApp();
   const [sidebarItems, setSidebarItems] = useState<SidebarMenuRecord[]>([]);
+  const [sidebarLoadError, setSidebarLoadError] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [canRolePreview, setCanRolePreview] = useState(false);
 
   const scopeFromRole: Record<UserRoleType, 'admin' | 'moderator' | 'staff' | 'vendor' | 'customer'> = {
     super_admin: 'admin',
@@ -109,11 +125,11 @@ export const DashboardShell: React.FC = () => {
 
   useEffect(() => {
     if (!user) return;
-    if (user.user_type === 'super_admin') setCanRolePreview(true);
+    setSidebarLoadError(false);
     apiRequest<{ items: SidebarMenuRecord[] }>(`/auth/sidebar?scope=${expectedScope}`)
       .then((res) => setSidebarItems(res.items || []))
-      .catch(() => {});
-  }, [user, expectedScope]);
+      .catch(() => setSidebarLoadError(true));
+  }, [user, expectedScope, tenantId]);
 
   useEffect(() => {
     if (!user) return;
@@ -188,13 +204,34 @@ export const DashboardShell: React.FC = () => {
           </span>
           <span className="text-sm">{t(locale, 'brand_name')}</span>
         </button>
-        <button type="button" className="lg:hidden" onClick={() => setMobileMenuOpen(false)}>
+        <button
+          type="button"
+          aria-label={locale === 'ar' ? 'إغلاق القائمة' : 'Close navigation menu'}
+          className="lg:hidden"
+          onClick={() => setMobileMenuOpen(false)}
+        >
           <X className="h-5 w-5" />
         </button>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
-        {Array.from(groups.entries()).map(([groupName, items]) => (
+        {sidebarLoadError ? (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+            <p>{locale === 'ar' ? 'تعذر تحميل قائمة الإدارة.' : 'Could not load the dashboard menu.'}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setSidebarLoadError(false);
+                apiRequest<{ items: SidebarMenuRecord[] }>(`/auth/sidebar?scope=${expectedScope}`)
+                  .then((res) => setSidebarItems(res.items || []))
+                  .catch(() => setSidebarLoadError(true));
+              }}
+              className="mt-2 underline underline-offset-2"
+            >
+              {locale === 'ar' ? 'إعادة المحاولة' : 'Retry'}
+            </button>
+          </div>
+        ) : Array.from(groups.entries()).map(([groupName, items]) => (
           <div key={groupName} className="space-y-1">
             <div className="px-3 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-secondary)]">
               {groupName}
@@ -206,6 +243,7 @@ export const DashboardShell: React.FC = () => {
                 <button
                   key={item.id}
                   type="button"
+                  aria-current={active ? 'page' : undefined}
                   onClick={() => {
                     navigate(item.route_path);
                     setMobileMenuOpen(false);
@@ -250,7 +288,12 @@ export const DashboardShell: React.FC = () => {
       {/* Mobile Drawer */}
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-50 flex lg:hidden no-print">
-          <div className="fixed inset-0 bg-black/40" onClick={() => setMobileMenuOpen(false)} />
+          <button
+            type="button"
+            aria-label={locale === 'ar' ? 'إغلاق القائمة' : 'Close navigation menu'}
+            className="fixed inset-0 bg-black/40"
+            onClick={() => setMobileMenuOpen(false)}
+          />
           <div className="relative z-10 w-64 max-w-[80vw] h-full border-e border-[var(--border-hairline)]">
             {sidebarContent}
           </div>
@@ -274,11 +317,38 @@ export const DashboardShell: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2.5">
-            {canRolePreview && (
+            {user.user_type === 'super_admin' && (bootstrap?.tenants.length || 0) > 1 && (
+              <select
+                value={tenantId}
+                onChange={(event) => switchTenant(event.target.value)}
+                aria-label={locale === 'ar' ? 'مساحة المستأجر الحالية' : 'Current tenant workspace'}
+                className="max-w-40 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)]"
+              >
+                {bootstrap!.tenants.map((tenant) => (
+                  <option key={tenant.id} value={tenant.id}>{tenant.name}</option>
+                ))}
+              </select>
+            )}
+
+            {isRolePreview && (
+              <button
+                type="button"
+                onClick={exitRolePreview}
+                className="rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 text-xs font-medium hover:bg-[var(--surface-muted)]"
+              >
+                {locale === 'ar' ? 'إنهاء المعاينة' : 'Exit preview'}
+              </button>
+            )}
+
+            {user.user_type === 'super_admin' && (
               <select
                 value={user.user_type}
-                onChange={(e) => switchRolePreview(e.target.value as UserRoleType)}
-                aria-label="Role Preview Switcher"
+                aria-label={locale === 'ar' ? 'معاينة لوحة دور آخر' : 'Preview another role dashboard'}
+                onChange={(event) => {
+                  void switchRolePreview(event.target.value as UserRoleType).catch((err) => {
+                    notify(err instanceof Error ? err.message : 'Could not start role preview', 'error');
+                  });
+                }}
                 className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)]"
               >
                 <option value="super_admin">{t(locale, 'super_admin')}</option>
@@ -319,7 +389,7 @@ export const DashboardShell: React.FC = () => {
         </header>
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
-          {renderMainContent()}
+          <React.Fragment key={tenantId}>{renderMainContent()}</React.Fragment>
         </main>
       </div>
     </div>

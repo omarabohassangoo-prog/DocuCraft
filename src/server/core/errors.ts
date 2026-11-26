@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import { ZodError } from 'zod';
 
 export class AppError extends Error {
   public readonly status: number;
@@ -30,6 +31,22 @@ export function problemDetailsHandler(
 ): void {
   const traceId = (req.headers['x-request-id'] as string) || `req_${crypto.randomBytes(6).toString('hex')}`;
   const isProd = process.env.NODE_ENV === 'production';
+
+  if (err instanceof ZodError) {
+    res.status(400).json({
+      success: false,
+      type: 'https://ufuq.commerce/errors/validation_error',
+      title: 'Invalid request data',
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      detail: 'One or more request fields are invalid.',
+      details: err.flatten(),
+      instance: req.originalUrl,
+      traceId,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
 
   if (err instanceof AppError) {
     res.status(err.status).json({

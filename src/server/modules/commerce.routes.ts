@@ -46,6 +46,18 @@ function resolveCart(db: DatabaseSchema, req: AuthRequest) {
   return cart;
 }
 
+function tenantTaxRate(db: DatabaseSchema, tenantId: string): number {
+  const configuredRate = db.system_settings.find(
+    (setting) =>
+      setting.tenant_id === tenantId &&
+      setting.setting_group === 'ecommerce' &&
+      setting.setting_key === 'vat_rate'
+  )?.setting_value;
+  return typeof configuredRate === 'number' && Number.isFinite(configuredRate) && configuredRate >= 0 && configuredRate <= 100
+    ? configuredRate / 100
+    : 0.15;
+}
+
 function hydrateCart(db: DatabaseSchema, cartId: string) {
   const items = db.cart_items
     .filter((ci) => ci.cart_id === cartId)
@@ -66,8 +78,16 @@ function hydrateCart(db: DatabaseSchema, cartId: string) {
     .filter((i) => i.variant && i.product);
 
   const subtotal = items.reduce((s, i) => s + Number(i.variant!.price) * i.quantity, 0);
-  const taxRate = 0.15;
-  const tax_amount = Number((subtotal * taxRate).toFixed(2));
+  const cartTenantId = db.carts.find((cart) => cart.id === cartId)?.tenant_id || '';
+  const taxRate = tenantTaxRate(db, cartTenantId);
+  const tax_amount = Number(
+    items
+      .reduce((sum, item) => {
+        const lineNet = Number(item.variant!.price) * item.quantity;
+        return sum + Number((lineNet * taxRate).toFixed(2));
+      }, 0)
+      .toFixed(2)
+  );
   const shipping_amount = items.length > 0 ? 28 : 0;
   const grand_total = Number((subtotal + tax_amount + shipping_amount).toFixed(2));
   return { items, subtotal, tax_amount, shipping_amount, grand_total };
@@ -330,6 +350,7 @@ commerceRouter.post('/checkout/initiate', requireAuth, async (req, res, next) =>
 
       let subtotal = 0;
       let totalTax = 0;
+      const taxRate = tenantTaxRate(db, authReq.tenantId);
       const suborders = [];
 
       let vendorIdx = 1;
@@ -342,7 +363,7 @@ commerceRouter.post('/checkout/initiate', requireAuth, async (req, res, next) =>
           const variant = db.product_variants.find((v) => v.id === ci.variant_id)!;
           const product = db.products.find((p) => p.id === variant.product_id)!;
           const lineNet = Number(variant.price) * ci.quantity;
-          const lineTax = Number((lineNet * (product.tax_rate / 100)).toFixed(2));
+          const lineTax = Number((lineNet * taxRate).toFixed(2));
           vendorGross += lineNet;
           totalTax += lineTax;
 

@@ -2,6 +2,7 @@ import express, { type Express, type Request } from 'express';
 import dotenv from 'dotenv';
 import { dbStore } from './core/db.ts';
 import { cacheStore } from './core/cache.ts';
+import { attachTenantAndAuth, type AuthRequest } from './core/auth-guard.ts';
 import { problemDetailsHandler } from './core/errors.ts';
 import { authRouter } from './modules/auth.routes.ts';
 import { publicRouter } from './modules/public.routes.ts';
@@ -156,6 +157,35 @@ export function createApiApp(): Express {
     const unit = db.ad_units.find((a) => a.is_active);
     const pubId = unit?.adsense_client_id?.replace('ca-', '') || 'pub-7429103847102934';
     res.type('text/plain').send(`google.com, ${pubId}, DIRECT, f08c47fec0942fa0`);
+  });
+
+  app.use('/api/v1', (req, res, next) => {
+    attachTenantAndAuth(req, res, () => {
+      const authReq = req as AuthRequest;
+      const db = dbStore.snapshot();
+      const maintenanceEnabled = db.system_settings.some(
+        (setting) =>
+          setting.tenant_id === authReq.tenantId &&
+          setting.setting_group === 'feature_flags' &&
+          setting.setting_key === 'maintenance_mode' &&
+          setting.setting_value === true
+      );
+      const safeDuringMaintenance =
+        req.path === '/public/bootstrap' ||
+        (req.path.startsWith('/auth/') && req.path !== '/auth/register');
+
+      if (!maintenanceEnabled || authReq.authUser?.user_type === 'super_admin' || safeDuringMaintenance) {
+        next();
+        return;
+      }
+
+      res.status(503).json({
+        success: false,
+        code: 'MAINTENANCE_MODE',
+        title: 'Store maintenance in progress',
+        detail: 'The storefront is temporarily unavailable while maintenance is in progress.',
+      });
+    });
   });
 
   // Modular API Routers

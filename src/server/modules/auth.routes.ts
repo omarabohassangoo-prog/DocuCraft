@@ -631,13 +631,7 @@ authRouter.post('/role-preview', requireAuth, async (req, res, next) => {
       .parse(req.body);
 
     const db = dbStore.snapshot();
-    // Only super_admin or an admin-originated session can use role-preview
-    const currentSession = db.user_sessions.find((s) => s.id === authReq.sessionId);
-    const isAdminSession =
-      authReq.authUser!.user_type === 'super_admin' ||
-      currentSession?.user_agent.includes('admin-preview');
-
-    if (!isAdminSession) {
+    if (authReq.authUser!.user_type !== 'super_admin') {
       throw new AppError({ status: 403, code: 'FORBIDDEN', message: 'Only Super Admin sessions may inspect role views' });
     }
 
@@ -736,10 +730,13 @@ authRouter.get('/sidebar', requireAuth, (req, res, next) => {
       });
     }
 
+    const menuTenantId = user.user_type === 'super_admin'
+      ? db.users.find((candidate) => candidate.id === user.id)?.tenant_id || authReq.tenantId
+      : authReq.tenantId;
     const items = db.sidebar_menus
       .filter(
         (m) =>
-          m.tenant_id === authReq.tenantId &&
+          m.tenant_id === menuTenantId &&
           m.dashboard_scope === requestedScope &&
           m.is_active &&
           (user.user_type === 'super_admin' || user.permissions.includes(m.required_permission))

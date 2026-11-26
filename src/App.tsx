@@ -18,13 +18,52 @@ import {
 } from './client/pages/PublicPages.tsx';
 import { CheckoutPage, InvoiceView } from './client/pages/CheckoutPage.tsx';
 import { AuthPages } from './client/pages/AuthPages.tsx';
-import { DashboardShell } from './client/pages/DashboardShell.tsx';
+
+const DashboardShell = React.lazy(() =>
+  import('./client/pages/DashboardShell.tsx').then((module) => ({ default: module.DashboardShell }))
+);
 
 const RouterView: React.FC = () => {
-  const { route } = useApp();
+  const { route, user, bootstrap, navigate, locale } = useApp();
+  const maintenanceEnabled = bootstrap?.settings['feature_flags.maintenance_mode'] === true;
+
+  if (maintenanceEnabled && user?.user_type !== 'super_admin' && !route.startsWith('/auth/')) {
+    return (
+      <main lang={locale} dir={locale === 'ar' ? 'rtl' : 'ltr'} className="flex min-h-screen items-center justify-center bg-[var(--surface-canvas)] px-5 py-16">
+        <section className="w-full max-w-xl rounded-2xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-8 text-center shadow-sm sm:p-12">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--brand-primary)]">Ufuq Commerce</p>
+          <h1 className="mt-4 text-2xl font-bold text-[var(--text-primary)]">
+            {locale === 'ar' ? 'المتجر تحت الصيانة' : 'We’ll be back soon'}
+          </h1>
+          <p className="mt-3 text-sm leading-7 text-[var(--text-secondary)]">
+            {locale === 'ar'
+              ? 'نعمل على تحسين المنصة. يرجى العودة بعد قليل.'
+              : 'We’re improving the platform. Please check back shortly.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => navigate('/auth/login')}
+            className="mt-7 rounded-lg bg-[var(--brand-primary)] px-5 py-2.5 text-sm font-semibold text-white"
+          >
+            {locale === 'ar' ? 'دخول المدير' : 'Admin sign in'}
+          </button>
+        </section>
+      </main>
+    );
+  }
 
   if (route.startsWith('/dashboard')) {
-    return <DashboardShell />;
+    return (
+      <React.Suspense
+        fallback={(
+          <div role="status" aria-live="polite" className="flex min-h-screen items-center justify-center text-sm text-[var(--text-secondary)]">
+            {locale === 'ar' ? 'جارٍ تحميل لوحة التحكم...' : 'Loading dashboard...'}
+          </div>
+        )}
+      >
+        <DashboardShell />
+      </React.Suspense>
+    );
   }
 
   const renderPublicView = () => {
