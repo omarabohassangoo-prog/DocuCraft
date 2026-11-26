@@ -30,7 +30,7 @@ afterAll(async () => {
 async function api<T = Record<string, unknown>>(
   path: string,
   options: RequestInit & { token?: string; guestToken?: string } = {}
-): Promise<{ status: number; json: { success: boolean; data?: T; code?: string; message?: string } }> {
+): Promise<{ status: number; json: { success: boolean; data?: T; meta?: { tenant_id: string }; code?: string; message?: string } }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
@@ -192,6 +192,20 @@ describe('Ufuq Multi-Vendor Commerce End-to-End Verification', () => {
       expect(adminSidebar.status).toBe(200);
       expect(adminSidebar.json.data!.items.length).toBe(10);
 
+      const secondTenantId = '22222222-2222-4222-8222-222222222222';
+      const crossTenantSidebar = await api<{ items: { route_path: string }[] }>(
+        '/api/v1/auth/sidebar?scope=admin',
+        { token: adminToken, headers: { 'X-Tenant-ID': secondTenantId } }
+      );
+      expect(crossTenantSidebar.status).toBe(200);
+      expect(crossTenantSidebar.json.data!.items.length).toBe(10);
+      const crossTenantRows = await api('/api/v1/crud/vendors', {
+        token: adminToken,
+        headers: { 'X-Tenant-ID': secondTenantId },
+      });
+      expect(crossTenantRows.status).toBe(200);
+      expect(crossTenantRows.json.meta?.tenant_id).toBe(secondTenantId);
+
       for (const ep of [
         '/api/v1/admin/dashboard/analytics',
         '/api/v1/admin/cms/pages',
@@ -211,6 +225,93 @@ describe('Ufuq Multi-Vendor Commerce End-to-End Verification', () => {
         expect(res.status).toBe(200);
       }
 
+      const analytics = await api<{
+        kpis: {
+          grossRevenue: number;
+          platformCommission: number;
+          vendorNet: number;
+          totalOrders: number;
+          suborderCount: number;
+          activeProducts: number;
+        };
+      }>('/api/v1/admin/dashboard/analytics', { token: adminToken });
+      const snapshot = dbStore.snapshot();
+      const adminTenantId = snapshot.users.find((u) => u.email === 'admin@ufuq.commerce')!.tenant_id;
+      const paidSuborders = snapshot.vendor_suborders.filter((suborder) => {
+        const order = snapshot.orders.find((candidate) => candidate.id === suborder.order_id);
+        return suborder.tenant_id === adminTenantId && order?.payment_status === 'paid' && order.order_status !== 'cancelled';
+      });
+      expect(analytics.json.data!.kpis.grossRevenue).toBeCloseTo(
+        paidSuborders.reduce((sum, suborder) => sum + suborder.gross_amount, 0)
+      );
+      expect(analytics.json.data!.kpis.platformCommission).toBeCloseTo(
+        paidSuborders.reduce((sum, suborder) => sum + suborder.commission_amount, 0)
+      );
+      expect(analytics.json.data!.kpis.totalOrders).toBe(new Set(paidSuborders.map((s) => s.order_id)).size);
+      expect(analytics.json.data!.kpis.suborderCount).toBe(paidSuborders.length);
+      expect(analytics.json.data!.kpis.activeProducts).toBe(
+        snapshot.products.filter((p) => p.tenant_id === adminTenantId && !p.deleted_at && p.status === 'active').length
+      );
+      const invalidVat = await api('/api/v1/admin/settings', {
+        method: 'PUT',
+        token: adminToken,
+        body: JSON.stringify({ updates: [{ setting_group: 'ecommerce', setting_key: 'vat_rate', setting_value: 101 }] }),
+      });
+      expect(invalidVat.status).toBe(400);
+      expect(invalidVat.json.code).toBe('INVALID_SETTING_VALUE');
+      const invalidAdUnit = await api('/api/v1/admin/adsense', {
+        method: 'POST',
+        token: adminToken,
+        body: JSON.stringify({
+          name: 'Invalid ad unit',
+          adsense_client_id: 'not-a-publisher-id',
+          adsense_slot_id: '12345678',
+          placement: 'blog_sidebar',
+        }),
+      });
+      expect(invalidAdUnit.status).toBe(400);
+
+      const originalVatRate = snapshot.system_settings.find(
+        (setting) => setting.tenant_id === adminTenantId && setting.setting_key === 'vat_rate'
+      )?.setting_value;
+      const taxVariant = snapshot.product_variants.find(
+        (variant) => variant.tenant_id === adminTenantId && variant.is_active && variant.stock_qty > variant.reserved_qty
+      );
+      expect(taxVariant).toBeDefined();
+      const taxGuestToken = `admin-tax-${crypto.randomUUID()}`;
+      let taxCartItemId: string | undefined;
+      try {
+        const vatSaved = await api('/api/v1/admin/settings', {
+          method: 'PUT',
+          token: adminToken,
+          body: JSON.stringify({ updates: [{ setting_group: 'ecommerce', setting_key: 'vat_rate', setting_value: 7.5 }] }),
+        });
+        expect(vatSaved.status).toBe(200);
+        const cartWithTax = await api<{ subtotal: number; tax_amount: number; items: { id: string }[] }>('/api/v1/cart/items', {
+          method: 'POST',
+          guestToken: taxGuestToken,
+          body: JSON.stringify({ variant_id: taxVariant!.id, quantity: 1 }),
+        });
+        expect(cartWithTax.status).toBe(201);
+        taxCartItemId = cartWithTax.json.data!.items[0].id;
+        expect(cartWithTax.json.data!.tax_amount).toBeCloseTo(cartWithTax.json.data!.subtotal * 0.075, 2);
+        const removedTaxItem = await api(`/api/v1/cart/items/${taxCartItemId}`, {
+          method: 'DELETE',
+          guestToken: taxGuestToken,
+        });
+        expect(removedTaxItem.status).toBe(200);
+        taxCartItemId = undefined;
+      } finally {
+        if (taxCartItemId) {
+          await api(`/api/v1/cart/items/${taxCartItemId}`, { method: 'DELETE', guestToken: taxGuestToken });
+        }
+        await api('/api/v1/admin/settings', {
+          method: 'PUT',
+          token: adminToken,
+          body: JSON.stringify({ updates: [{ setting_group: 'ecommerce', setting_key: 'vat_rate', setting_value: originalVatRate ?? 15 }] }),
+        });
+      }
+
       // 2. Moderator dashboard verification & strict RBAC isolation
       const modPrev = await api<{ accessToken: string }>('/api/v1/auth/role-preview', {
         method: 'POST',
@@ -219,6 +320,18 @@ describe('Ufuq Multi-Vendor Commerce End-to-End Verification', () => {
       });
       expect(modPrev.status).toBe(200);
       const modToken = modPrev.json.data!.accessToken;
+      const chainedPreview = await api('/api/v1/auth/role-preview', {
+        method: 'POST',
+        token: modToken,
+        body: JSON.stringify({ target_role: 'super_admin' }),
+      });
+      expect(chainedPreview.status).toBe(403);
+      const modTenantProbe = await api('/api/v1/crud/vendors', {
+        token: modToken,
+        headers: { 'X-Tenant-ID': '22222222-2222-4222-8222-222222222222' },
+      });
+      expect(modTenantProbe.status).toBe(200);
+      expect(modTenantProbe.json.meta?.tenant_id).toBe('11111111-1111-4111-8111-111111111111');
 
       const modSidebar = await api<{ items: { route_path: string }[] }>('/api/v1/auth/sidebar?scope=moderator', {
         token: modToken,
@@ -428,6 +541,29 @@ describe('Ufuq Multi-Vendor Commerce End-to-End Verification', () => {
         '/api/v1/crud/notification_logs',
       ]) {
         expect((await api(deniedEp, { token: custToken })).status).toBe(403);
+      }
+
+      const previousMaintenance = snapshot.system_settings.find(
+        (setting) => setting.tenant_id === adminTenantId && setting.setting_key === 'maintenance_mode'
+      )?.setting_value;
+      try {
+        const maintenanceOn = await api('/api/v1/admin/settings', {
+          method: 'PUT',
+          token: adminToken,
+          body: JSON.stringify({ updates: [{ setting_group: 'feature_flags', setting_key: 'maintenance_mode', setting_value: true, is_public: true }] }),
+        });
+        expect(maintenanceOn.status).toBe(200);
+        const storeBlocked = await api('/api/v1/public/catalog', { token: custToken });
+        expect(storeBlocked.status).toBe(503);
+        expect(storeBlocked.json.code).toBe('MAINTENANCE_MODE');
+        expect((await api('/api/v1/admin/settings', { token: adminToken })).status).toBe(200);
+        expect((await api('/api/v1/auth/status')).status).toBe(200);
+      } finally {
+        await api('/api/v1/admin/settings', {
+          method: 'PUT',
+          token: adminToken,
+          body: JSON.stringify({ updates: [{ setting_group: 'feature_flags', setting_key: 'maintenance_mode', setting_value: previousMaintenance ?? false, is_public: true }] }),
+        });
       }
     } finally {
       if (prevPasscode === undefined) {

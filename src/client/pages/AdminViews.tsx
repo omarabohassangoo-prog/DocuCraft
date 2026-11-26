@@ -38,18 +38,37 @@ interface AnalyticsData {
   monthlySeries: { month: string; revenue: number; commission: number; orders: number }[];
 }
 
+const AdminLoadFailure: React.FC<{ locale: string; onRetry: () => void }> = ({ locale, onRetry }) => (
+  <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+    <p>{locale === 'ar' ? 'تعذر تحميل البيانات. تحقق من الاتصال ثم أعد المحاولة.' : 'Could not load data. Check your connection and try again.'}</p>
+    <button type="button" onClick={onRetry} className="mt-3 rounded-lg border border-current px-3 py-1.5 text-xs font-semibold">
+      {locale === 'ar' ? 'إعادة المحاولة' : 'Retry'}
+    </button>
+  </div>
+);
+
 export const AdminOverviewView: React.FC = () => {
   const { locale } = useApp();
   const [data, setData] = useState<AnalyticsData | null>(null);
+  const [loadError, setLoadError] = useState(false);
 
-  useEffect(() => {
+  const loadAnalytics = () => {
+    setLoadError(false);
     apiRequest<AnalyticsData>('/admin/dashboard/analytics')
       .then(setData)
-      .catch(() => {});
+      .catch(() => setLoadError(true));
+  };
+
+  useEffect(() => {
+    loadAnalytics();
   }, []);
 
+  if (!data && loadError) {
+    return <AdminLoadFailure locale={locale} onRetry={loadAnalytics} />;
+  }
+
   if (!data) {
-    return <div className="p-8 text-sm text-[var(--text-secondary)]">Loading analytics...</div>;
+    return <div className="p-8 text-sm text-[var(--text-secondary)]" aria-live="polite">{locale === 'ar' ? 'جارٍ تحميل التحليلات...' : 'Loading analytics...'}</div>;
   }
 
   const cards = [
@@ -131,19 +150,33 @@ export const AdminCmsEditorView: React.FC = () => {
   const [selectedSection, setSelectedSection] = useState<CmsSectionRecord | null>(null);
   const [draftAr, setDraftAr] = useState('');
   const [draftEn, setDraftEn] = useState('');
+  const [isVisible, setIsVisible] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   const loadPages = () => {
+    setLoadError(false);
     apiRequest<{ pages: (CmsPageRecord & { sections: CmsSectionRecord[] })[] }>('/admin/cms/pages')
       .then((res) => {
-        setPages(res.pages || []);
-        if (!selectedSection && res.pages?.[0]?.sections?.[0]) {
-          const sec = res.pages[0].sections[0];
+        const nextPages = res.pages || [];
+        setPages(nextPages);
+        const refreshedSelection = selectedSection
+          ? nextPages.flatMap((page) => page.sections).find((section) => section.id === selectedSection.id)
+          : null;
+        if (refreshedSelection) {
+          setSelectedSection(refreshedSelection);
+          setIsVisible(refreshedSelection.is_visible);
+          setDraftAr(JSON.stringify(refreshedSelection.content_i18n.ar, null, 2));
+          setDraftEn(JSON.stringify(refreshedSelection.content_i18n.en, null, 2));
+        } else if (!selectedSection && nextPages[0]?.sections[0]) {
+          const sec = nextPages[0].sections[0];
           setSelectedSection(sec);
+          setIsVisible(sec.is_visible);
           setDraftAr(JSON.stringify(sec.content_i18n.ar, null, 2));
           setDraftEn(JSON.stringify(sec.content_i18n.en, null, 2));
         }
       })
-      .catch(() => {});
+      .catch(() => setLoadError(true));
   };
 
   useEffect(() => {
@@ -153,33 +186,43 @@ export const AdminCmsEditorView: React.FC = () => {
 
   const selectSec = (sec: CmsSectionRecord) => {
     setSelectedSection(sec);
+    setIsVisible(sec.is_visible);
     setDraftAr(JSON.stringify(sec.content_i18n.ar, null, 2));
     setDraftEn(JSON.stringify(sec.content_i18n.en, null, 2));
   };
 
   const handleSave = async () => {
-    if (!selectedSection) return;
+    if (!selectedSection || saving) return;
+    setSaving(true);
     try {
       const arObj = JSON.parse(draftAr);
       const enObj = JSON.parse(draftEn);
       await apiRequest(`/admin/cms/sections/${selectedSection.id}`, {
         method: 'PUT',
-        body: JSON.stringify({ content_i18n: { ar: arObj, en: enObj }, is_visible: true }),
+        body: JSON.stringify({ content_i18n: { ar: arObj, en: enObj }, is_visible: isVisible }),
       });
       notify(locale === 'ar' ? 'تم حفظ القسم وتحديث الكاش فوراً' : 'CMS section saved & cache invalidated', 'success');
       loadPages();
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Invalid JSON or save error', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      {loadError && <div className="lg:col-span-12"><AdminLoadFailure locale={locale} onRetry={loadPages} /></div>}
       <div className="lg:col-span-4 rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-4 space-y-4">
         <h3 className="text-sm font-bold text-[var(--text-primary)]">
           {locale === 'ar' ? 'الصفحات والأقسام الديناميكية' : 'CMS Pages & Sections'}
         </h3>
         <div className="space-y-3">
+          {pages.length === 0 && !loadError && (
+            <p className="rounded-lg bg-[var(--surface-muted)] p-3 text-xs text-[var(--text-secondary)]">
+              {locale === 'ar' ? 'لا توجد صفحات محتوى لهذا المستأجر بعد.' : 'No CMS pages are configured for this tenant yet.'}
+            </p>
+          )}
           {pages.map((p) => (
             <div key={p.id} className="space-y-1">
               <div className="text-xs font-semibold text-[var(--text-secondary)]">
@@ -205,24 +248,37 @@ export const AdminCmsEditorView: React.FC = () => {
       </div>
 
       <div className="lg:col-span-8 rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-6 space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h3 className="text-base font-bold text-[var(--text-primary)]">
             {locale === 'ar' ? 'محرر المحتوى ثنائي اللغة' : 'Bilingual Section Editor'}
           </h3>
-          <button
-            type="button"
-            onClick={handleSave}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white"
-          >
-            <Save className="h-3.5 w-3.5" />
-            {locale === 'ar' ? 'حفظ ونشر' : 'Save & Publish'}
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-[var(--text-secondary)]">
+              <input
+                type="checkbox"
+                checked={isVisible}
+                disabled={!selectedSection}
+                onChange={(event) => setIsVisible(event.target.checked)}
+              />
+              {locale === 'ar' ? 'إظهار القسم في الموقع' : 'Show section on the site'}
+            </label>
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving || !selectedSection}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Save className="h-3.5 w-3.5" />
+              {saving ? (locale === 'ar' ? 'جارٍ الحفظ...' : 'Saving...') : locale === 'ar' ? 'حفظ التغييرات' : 'Save changes'}
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs font-semibold text-[var(--text-secondary)] mb-1">العربية (AR JSON)</label>
+            <label htmlFor="cms-ar-json" className="block text-xs font-semibold text-[var(--text-secondary)] mb-1">العربية (AR JSON)</label>
             <textarea
+              id="cms-ar-json"
               rows={14}
               value={draftAr}
               onChange={(e) => setDraftAr(e.target.value)}
@@ -231,8 +287,9 @@ export const AdminCmsEditorView: React.FC = () => {
             />
           </div>
           <div>
-            <label className="block text-xs font-semibold text-[var(--text-secondary)] mb-1">English (EN JSON)</label>
+            <label htmlFor="cms-en-json" className="block text-xs font-semibold text-[var(--text-secondary)] mb-1">English (EN JSON)</label>
             <textarea
+              id="cms-en-json"
               rows={14}
               value={draftEn}
               onChange={(e) => setDraftEn(e.target.value)}
@@ -250,15 +307,20 @@ export const AdminSeoAdsView: React.FC = () => {
   const { locale, notify, refreshBootstrap } = useApp();
   const [adUnits, setAdUnits] = useState<AdUnitRecord[]>([]);
   const [ga4Id, setGa4Id] = useState('');
+  const [loadError, setLoadError] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savingAd, setSavingAd] = useState(false);
+  const [togglingAdId, setTogglingAdId] = useState<string | null>(null);
   const [robotsTxt, setRobotsTxt] = useState('');
   const [newAd, setNewAd] = useState({
     name: '',
-    adsense_client_id: 'ca-pub-7429103847102934',
+    adsense_client_id: '',
     adsense_slot_id: '',
     placement: 'blog_sidebar' as AdUnitRecord['placement'],
   });
 
   const load = () => {
+    setLoadError(false);
     apiRequest<{ settings: SystemSettingRecord[]; adUnits: AdUnitRecord[] }>('/admin/settings')
       .then((res) => {
         setAdUnits(res.adUnits || []);
@@ -267,7 +329,7 @@ export const AdminSeoAdsView: React.FC = () => {
         if (ga) setGa4Id(String(ga.setting_value || ''));
         if (rb) setRobotsTxt(String(rb.setting_value || ''));
       })
-      .catch(() => {});
+      .catch(() => setLoadError(true));
   };
 
   useEffect(() => {
@@ -275,42 +337,67 @@ export const AdminSeoAdsView: React.FC = () => {
   }, []);
 
   const saveSeo = async () => {
-    await apiRequest('/admin/settings', {
-      method: 'PUT',
-      body: JSON.stringify({
-        updates: [
-          { setting_group: 'analytics', setting_key: 'ga4_measurement_id', setting_value: ga4Id, is_public: true },
-          { setting_group: 'seo', setting_key: 'robots_txt', setting_value: robotsTxt, is_public: false },
-        ],
-      }),
-    });
-    await refreshBootstrap();
-    notify(locale === 'ar' ? 'تم حفظ إعدادات SEO و GA4' : 'SEO & GA4 settings updated', 'success');
+    if (saving) return;
+    setSaving(true);
+    try {
+      await apiRequest('/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          updates: [
+            { setting_group: 'analytics', setting_key: 'ga4_measurement_id', setting_value: ga4Id, is_public: true },
+            { setting_group: 'seo', setting_key: 'robots_txt', setting_value: robotsTxt, is_public: false },
+          ],
+        }),
+      });
+      await refreshBootstrap();
+      notify(locale === 'ar' ? 'تم حفظ إعدادات SEO و GA4' : 'SEO & GA4 settings updated', 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to save SEO settings', 'error');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const toggleAdUnit = async (unit: AdUnitRecord) => {
-    await apiRequest('/admin/adsense', {
-      method: 'POST',
-      body: JSON.stringify({ ...unit, is_active: !unit.is_active }),
-    });
-    await refreshBootstrap();
-    load();
+    if (togglingAdId) return;
+    setTogglingAdId(unit.id);
+    try {
+      await apiRequest('/admin/adsense', {
+        method: 'POST',
+        body: JSON.stringify({ ...unit, is_active: !unit.is_active }),
+      });
+      await refreshBootstrap();
+      load();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to update ad unit', 'error');
+    } finally {
+      setTogglingAdId(null);
+    }
   };
 
   const createAdUnit = async (e: React.FormEvent) => {
     e.preventDefault();
-    await apiRequest('/admin/adsense', {
-      method: 'POST',
-      body: JSON.stringify(newAd),
-    });
-    setNewAd({ ...newAd, name: '', adsense_slot_id: '' });
-    await refreshBootstrap();
-    load();
-    notify(locale === 'ar' ? 'تمت إضافة وحدة AdSense' : 'AdSense unit created', 'success');
+    if (savingAd) return;
+    setSavingAd(true);
+    try {
+      await apiRequest('/admin/adsense', {
+        method: 'POST',
+        body: JSON.stringify(newAd),
+      });
+      setNewAd({ ...newAd, name: '', adsense_slot_id: '' });
+      await refreshBootstrap();
+      load();
+      notify(locale === 'ar' ? 'تمت إضافة وحدة AdSense' : 'AdSense unit created', 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to create ad unit', 'error');
+    } finally {
+      setSavingAd(false);
+    }
   };
 
   return (
     <div className="space-y-6">
+      {loadError && <AdminLoadFailure locale={locale} onRetry={load} />}
       <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-base font-bold text-[var(--text-primary)]">
@@ -319,24 +406,27 @@ export const AdminSeoAdsView: React.FC = () => {
           <button
             type="button"
             onClick={saveSeo}
-            className="rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white"
+            disabled={saving}
+            className="rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white disabled:cursor-wait disabled:opacity-60"
           >
-            {locale === 'ar' ? 'حفظ SEO' : 'Save SEO'}
+            {saving ? (locale === 'ar' ? 'جارٍ الحفظ...' : 'Saving...') : locale === 'ar' ? 'حفظ SEO' : 'Save SEO'}
           </button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">GA4 Measurement ID</label>
+            <label htmlFor="admin-ga4-id" className="block text-xs font-medium text-[var(--text-secondary)] mb-1">GA4 Measurement ID</label>
             <input
+              id="admin-ga4-id"
               value={ga4Id}
               onChange={(e) => setGa4Id(e.target.value)}
               className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-sm font-mono-tabular"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">robots.txt</label>
+            <label htmlFor="admin-robots-txt" className="block text-xs font-medium text-[var(--text-secondary)] mb-1">robots.txt</label>
             <textarea
+              id="admin-robots-txt"
               rows={4}
               value={robotsTxt}
               onChange={(e) => setRobotsTxt(e.target.value)}
@@ -362,8 +452,10 @@ export const AdminSeoAdsView: React.FC = () => {
               </div>
               <button
                 type="button"
+                aria-pressed={u.is_active}
+                disabled={togglingAdId !== null}
                 onClick={() => toggleAdUnit(u)}
-                className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
+                className={`rounded-lg px-3 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${
                   u.is_active
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300'
                     : 'bg-[var(--surface-muted)] text-[var(--text-secondary)]'
@@ -375,22 +467,34 @@ export const AdminSeoAdsView: React.FC = () => {
           ))}
         </div>
 
-        <form onSubmit={createAdUnit} className="grid grid-cols-1 sm:grid-cols-4 gap-3 border-t border-[var(--border-hairline)] pt-4">
+        <form onSubmit={createAdUnit} className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3 border-t border-[var(--border-hairline)] pt-4">
           <input
             required
-            placeholder="Unit Name"
+            aria-label={locale === 'ar' ? 'اسم وحدة الإعلان' : 'Ad unit name'}
+            placeholder={locale === 'ar' ? 'اسم الوحدة' : 'Unit name'}
             value={newAd.name}
             onChange={(e) => setNewAd({ ...newAd, name: e.target.value })}
             className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs"
           />
           <input
             required
-            placeholder="Slot ID"
+            aria-label={locale === 'ar' ? 'معرف ناشر AdSense' : 'AdSense publisher ID'}
+            placeholder="ca-pub-1234567890123456"
+            pattern="ca-pub-[0-9]{16}"
+            value={newAd.adsense_client_id}
+            onChange={(e) => setNewAd({ ...newAd, adsense_client_id: e.target.value })}
+            className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs font-mono-tabular"
+          />
+          <input
+            required
+            aria-label={locale === 'ar' ? 'معرف موضع الإعلان' : 'Ad slot ID'}
+            placeholder={locale === 'ar' ? 'معرف الموضع' : 'Slot ID'}
             value={newAd.adsense_slot_id}
             onChange={(e) => setNewAd({ ...newAd, adsense_slot_id: e.target.value })}
             className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs font-mono-tabular"
           />
           <select
+            aria-label={locale === 'ar' ? 'موضع الإعلان' : 'Ad placement'}
             value={newAd.placement}
             onChange={(e) => setNewAd({ ...newAd, placement: e.target.value as AdUnitRecord['placement'] })}
             className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs"
@@ -400,9 +504,9 @@ export const AdminSeoAdsView: React.FC = () => {
             <option value="home_mid">home_mid</option>
             <option value="article_middle">article_middle</option>
           </select>
-          <button type="submit" className="inline-flex items-center justify-center gap-1 rounded-lg bg-[var(--brand-primary)] px-3 py-2 text-xs font-semibold text-white">
+          <button type="submit" disabled={savingAd} className="inline-flex items-center justify-center gap-1 rounded-lg bg-[var(--brand-primary)] px-3 py-2 text-xs font-semibold text-white disabled:cursor-wait disabled:opacity-60">
             <Plus className="h-3.5 w-3.5" />
-            {locale === 'ar' ? 'إضافة وحدة' : 'Add Ad Unit'}
+            {savingAd ? (locale === 'ar' ? 'جارٍ الإضافة...' : 'Adding...') : locale === 'ar' ? 'إضافة وحدة' : 'Add Ad Unit'}
           </button>
         </form>
       </div>
@@ -413,15 +517,22 @@ export const AdminSeoAdsView: React.FC = () => {
 export const AdminUsersRbacView: React.FC = () => {
   const { locale } = useApp();
   const [roles, setRoles] = useState<(RoleRecord & { permissions: PermissionRecord[] })[]>([]);
+  const [loadError, setLoadError] = useState(false);
 
-  useEffect(() => {
+  const loadRoles = () => {
+    setLoadError(false);
     apiRequest<{ roles: (RoleRecord & { permissions: PermissionRecord[] })[] }>('/admin/rbac/matrix')
       .then((res) => setRoles(res.roles || []))
-      .catch(() => {});
+      .catch(() => setLoadError(true));
+  };
+
+  useEffect(() => {
+    loadRoles();
   }, []);
 
   return (
     <div className="space-y-6">
+      {loadError && <AdminLoadFailure locale={locale} onRetry={loadRoles} />}
       <AdvancedDataTable resource="users" />
 
       <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-6 space-y-4">
@@ -476,7 +587,11 @@ export const AdminSettingsVaultView: React.FC = () => {
     env_key: 'STRIPE_SECRET_KEY',
     plaintext_value: '',
   });
-  const [pingResult, setPingResult] = useState<string | null>(null);
+  const [pingResult, setPingResult] = useState<{ text: string; status: string } | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [savingSecret, setSavingSecret] = useState(false);
+  const [testingService, setTestingService] = useState<string | null>(null);
 
   const loadVault = () => {
     apiRequest<{
@@ -487,10 +602,10 @@ export const AdminSettingsVaultView: React.FC = () => {
         setVaultSecrets(res.secrets || []);
         setEnvStatus(res.envConfiguredKeys || []);
       })
-      .catch(() => {});
+      .catch(() => setLoadError(true));
   };
 
-  useEffect(() => {
+  const loadSettings = () => {
     apiRequest<{ settings: SystemSettingRecord[] }>('/admin/settings')
       .then((res) => {
         const findVal = (k: string) => res.settings.find((s) => s.setting_key === k)?.setting_value;
@@ -500,29 +615,49 @@ export const AdminSettingsVaultView: React.FC = () => {
         if (findVal('enable_adsense') !== undefined) setAdsEnabled(Boolean(findVal('enable_adsense')));
         if (findVal('maintenance_mode') !== undefined) setMaintenance(Boolean(findVal('maintenance_mode')));
       })
-      .catch(() => {});
+      .catch(() => setLoadError(true));
+  };
+
+  const retryLoad = () => {
+    setLoadError(false);
+    loadSettings();
+    loadVault();
+  };
+
+  useEffect(() => {
+    loadSettings();
     loadVault();
   }, []);
 
   const saveSettings = async () => {
-    await apiRequest('/admin/settings', {
-      method: 'PUT',
-      body: JSON.stringify({
-        updates: [
-          { setting_group: 'theme', setting_key: 'brand_primary_color', setting_value: brandColor, is_public: true },
-          { setting_group: 'theme', setting_key: 'brand_accent_color', setting_value: accentColor, is_public: true },
-          { setting_group: 'ecommerce', setting_key: 'vat_rate', setting_value: vatRate, is_public: true },
-          { setting_group: 'feature_flags', setting_key: 'enable_adsense', setting_value: adsEnabled, is_public: true },
-          { setting_group: 'feature_flags', setting_key: 'maintenance_mode', setting_value: maintenance, is_public: true },
-        ],
-      }),
-    });
-    await refreshBootstrap();
-    notify(locale === 'ar' ? 'تم تحديث إعدادات المنصة والهوية' : 'Platform settings saved', 'success');
+    if (savingSettings) return;
+    setSavingSettings(true);
+    try {
+      await apiRequest('/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          updates: [
+            { setting_group: 'theme', setting_key: 'brand_primary_color', setting_value: brandColor, is_public: true },
+            { setting_group: 'theme', setting_key: 'brand_accent_color', setting_value: accentColor, is_public: true },
+            { setting_group: 'ecommerce', setting_key: 'vat_rate', setting_value: vatRate, is_public: true },
+            { setting_group: 'feature_flags', setting_key: 'enable_adsense', setting_value: adsEnabled, is_public: true },
+            { setting_group: 'feature_flags', setting_key: 'maintenance_mode', setting_value: maintenance, is_public: true },
+          ],
+        }),
+      });
+      await refreshBootstrap();
+      notify(locale === 'ar' ? 'تم تحديث إعدادات المنصة والهوية' : 'Platform settings saved', 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to save platform settings', 'error');
+    } finally {
+      setSavingSettings(false);
+    }
   };
 
   const saveSecret = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingSecret) return;
+    setSavingSecret(true);
     try {
       await apiRequest('/admin/env-secrets', {
         method: 'POST',
@@ -533,10 +668,14 @@ export const AdminSettingsVaultView: React.FC = () => {
       notify(locale === 'ar' ? 'تم تشفير المفتاح بـ AES-256-GCM وحفظه بأمان' : 'Secret encrypted (AES-256-GCM) & stored', 'success');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to encrypt secret', 'error');
+    } finally {
+      setSavingSecret(false);
     }
   };
 
   const testConnection = async (serviceName: string) => {
+    if (testingService) return;
+    setTestingService(serviceName);
     try {
       const res = await apiRequest<{
         service_name: string;
@@ -547,14 +686,20 @@ export const AdminSettingsVaultView: React.FC = () => {
         method: 'POST',
         body: JSON.stringify({ service_name: serviceName }),
       });
-      setPingResult(`${res.service_name}: ${res.status} — ${res.message} (${res.latency_ms}ms)`);
+      setPingResult({
+        text: `${res.service_name}: ${res.status} — ${res.message} (${res.latency_ms}ms)`,
+        status: res.status,
+      });
     } catch (err) {
-      setPingResult(err instanceof Error ? err.message : 'Ping failed');
+      setPingResult({ text: err instanceof Error ? err.message : 'Ping failed', status: 'error' });
+    } finally {
+      setTestingService(null);
     }
   };
 
   return (
     <div className="space-y-6">
+      {loadError && <AdminLoadFailure locale={locale} onRetry={retryLoad} />}
       <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-6 space-y-5">
         <div className="flex items-center justify-between">
           <h3 className="text-base font-bold text-[var(--text-primary)]">
@@ -563,31 +708,32 @@ export const AdminSettingsVaultView: React.FC = () => {
           <button
             type="button"
             onClick={saveSettings}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white"
+            disabled={savingSettings}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white disabled:cursor-wait disabled:opacity-60"
           >
             <Save className="h-3.5 w-3.5" />
-            {locale === 'ar' ? 'حفظ الإعدادات' : 'Save Settings'}
+            {savingSettings ? (locale === 'ar' ? 'جارٍ الحفظ...' : 'Saving...') : locale === 'ar' ? 'حفظ الإعدادات' : 'Save Settings'}
           </button>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
-            <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">Primary Brand Color</label>
+            <label htmlFor="admin-primary-color" className="block text-xs font-medium text-[var(--text-secondary)] mb-1">Primary Brand Color</label>
             <div className="flex items-center gap-2">
-              <input type="color" value={brandColor} onChange={(e) => setBrandColor(e.target.value)} className="h-9 w-12 rounded border border-[var(--border-hairline)]" />
-              <input value={brandColor} onChange={(e) => setBrandColor(e.target.value)} className="flex-1 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-1.5 font-mono-tabular text-xs" />
+              <input type="color" aria-label="Pick primary brand color" value={brandColor} onChange={(e) => setBrandColor(e.target.value)} className="h-9 w-12 rounded border border-[var(--border-hairline)]" />
+              <input id="admin-primary-color" value={brandColor} onChange={(e) => setBrandColor(e.target.value)} className="flex-1 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-1.5 font-mono-tabular text-xs" />
             </div>
           </div>
           <div>
-            <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">Accent Color</label>
+            <label htmlFor="admin-accent-color" className="block text-xs font-medium text-[var(--text-secondary)] mb-1">Accent Color</label>
             <div className="flex items-center gap-2">
-              <input type="color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} className="h-9 w-12 rounded border border-[var(--border-hairline)]" />
-              <input value={accentColor} onChange={(e) => setAccentColor(e.target.value)} className="flex-1 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-1.5 font-mono-tabular text-xs" />
+              <input type="color" aria-label="Pick accent color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} className="h-9 w-12 rounded border border-[var(--border-hairline)]" />
+              <input id="admin-accent-color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} className="flex-1 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-1.5 font-mono-tabular text-xs" />
             </div>
           </div>
           <div>
-            <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">VAT Rate (%)</label>
-            <input type="number" value={vatRate} onChange={(e) => setVatRate(Number(e.target.value))} className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-sm tabular-nums" />
+            <label htmlFor="admin-vat-rate" className="block text-xs font-medium text-[var(--text-secondary)] mb-1">VAT Rate (%)</label>
+            <input id="admin-vat-rate" type="number" min="0" max="100" step="0.01" value={vatRate} onChange={(e) => setVatRate(Number(e.target.value))} className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-sm tabular-nums" />
           </div>
         </div>
 
@@ -613,9 +759,14 @@ export const AdminSettingsVaultView: React.FC = () => {
             </h3>
           </div>
           {pingResult && (
-            <span className="inline-flex items-center gap-1.5 text-xs font-mono-tabular text-[var(--brand-primary)]">
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              {pingResult}
+            <span
+              role="status"
+              className={`inline-flex items-center gap-1.5 text-xs font-mono-tabular ${
+                pingResult.status === 'verified' ? 'text-emerald-700 dark:text-emerald-300' : 'text-red-700 dark:text-red-300'
+              }`}
+            >
+              {pingResult.status === 'verified' ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Shield className="h-3.5 w-3.5" />}
+              {pingResult.text}
             </span>
           )}
         </div>
@@ -629,10 +780,13 @@ export const AdminSettingsVaultView: React.FC = () => {
                   <span className="font-bold uppercase text-[var(--text-primary)]">{item.service_name}</span>
                   <button
                     type="button"
+                    disabled={testingService !== null}
                     onClick={() => testConnection(item.service_name)}
-                    className="text-[11px] font-semibold text-[var(--brand-primary)] hover:underline"
+                    className="text-[11px] font-semibold text-[var(--brand-primary)] hover:underline disabled:cursor-wait disabled:opacity-60"
                   >
-                    {locale === 'ar' ? 'فحص الاتصال الحي' : 'Live Ping'}
+                    {testingService === item.service_name
+                      ? (locale === 'ar' ? 'جارٍ الفحص...' : 'Testing...')
+                      : locale === 'ar' ? 'فحص الاتصال الحي' : 'Live Ping'}
                   </button>
                 </div>
                 <div className="font-mono-tabular text-[11px] text-[var(--text-secondary)]">{item.env_key}</div>
@@ -652,6 +806,7 @@ export const AdminSettingsVaultView: React.FC = () => {
 
         <form onSubmit={saveSecret} className="grid grid-cols-1 sm:grid-cols-4 gap-3 border-t border-[var(--border-hairline)] pt-4">
           <select
+            aria-label={locale === 'ar' ? 'الخدمة السرية' : 'Secret service'}
             value={secretForm.service_name}
             onChange={(e) => {
               const map: Record<string, string> = {
@@ -682,6 +837,7 @@ export const AdminSettingsVaultView: React.FC = () => {
 
           <input
             required
+            aria-label={locale === 'ar' ? 'اسم متغير البيئة' : 'Environment variable name'}
             value={secretForm.env_key}
             onChange={(e) => setSecretForm({ ...secretForm, env_key: e.target.value.toUpperCase() })}
             className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs font-mono-tabular"
@@ -690,14 +846,15 @@ export const AdminSettingsVaultView: React.FC = () => {
           <input
             type="password"
             required
+            aria-label={locale === 'ar' ? 'قيمة المفتاح السري' : 'Secret key value'}
             placeholder={locale === 'ar' ? 'أدخل المفتاح السري الجديد...' : 'Enter secret key value...'}
             value={secretForm.plaintext_value}
             onChange={(e) => setSecretForm({ ...secretForm, plaintext_value: e.target.value })}
             className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-canvas)] px-3 py-2 text-xs font-mono-tabular"
           />
 
-          <button type="submit" className="rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white">
-            {locale === 'ar' ? 'تشفير وحفظ' : 'Encrypt & Store'}
+          <button type="submit" disabled={savingSecret} className="rounded-lg bg-[var(--brand-primary)] px-4 py-2 text-xs font-semibold text-white disabled:cursor-wait disabled:opacity-60">
+            {savingSecret ? (locale === 'ar' ? 'جارٍ الحفظ...' : 'Saving...') : locale === 'ar' ? 'تشفير وحفظ' : 'Encrypt & Store'}
           </button>
         </form>
       </div>

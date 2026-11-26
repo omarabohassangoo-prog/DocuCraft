@@ -10,7 +10,7 @@ import type {
   ThemeMode,
   UserRoleType,
 } from '../../shared/types.ts';
-import { apiRequest, setApiAccessToken, setApiTenantId } from '../lib/api.ts';
+import { apiRequest, getApiAccessToken, setApiAccessToken, setApiTenantId } from '../lib/api.ts';
 
 export interface CartHydratedItem {
   id: string;
@@ -66,6 +66,8 @@ interface AppContextValue {
   setAuthSession: (token: string, user: SafeUserDTO) => void;
   logout: () => Promise<void>;
   switchRolePreview: (role: UserRoleType) => Promise<void>;
+  isRolePreview: boolean;
+  exitRolePreview: () => Promise<void>;
   authStatus: AuthStatusInfo | null;
   refreshAuthStatus: () => Promise<void>;
   bootstrap: BootstrapData | null;
@@ -100,6 +102,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [theme, setThemeState] = useState<ThemeMode>('light');
   const [tenantId, setTenantIdState] = useState<string>('11111111-1111-4111-8111-111111111111');
   const [user, setUser] = useState<SafeUserDTO | null>(null);
+  const [adminPreviewOrigin, setAdminPreviewOrigin] = useState<{ token: string; user: SafeUserDTO } | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthStatusInfo | null>(null);
   const [bootstrap, setBootstrap] = useState<BootstrapData | null>(null);
   const [cart, setCart] = useState<CartState>(EMPTY_CART);
@@ -272,15 +275,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string) => {
       setApiTenantId(id);
       setTenantIdState(id);
-      setApiAccessToken(null);
-      setUser(null);
-      notify(locale === 'ar' ? 'تم تبديل بيئة المستأجر بنجاح' : 'Switched tenant workspace', 'info');
+      setCart(EMPTY_CART);
+      if (user?.user_type !== 'super_admin') {
+        setApiAccessToken(null);
+        setUser(null);
+        setAdminPreviewOrigin(null);
+      }
+      notify(locale === 'ar' ? 'تم تبديل مساحة المستأجر' : 'Switched tenant workspace', 'info');
     },
-    [locale, notify]
+    [locale, notify, user]
   );
 
   const setAuthSession = useCallback(
     (token: string, nextUser: SafeUserDTO) => {
+      setAdminPreviewOrigin(null);
       setApiAccessToken(token);
       setUser(nextUser);
       refreshCart();
@@ -297,16 +305,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     setApiAccessToken(null);
     setUser(null);
+    setAdminPreviewOrigin(null);
     navigate('/');
     notify(locale === 'ar' ? 'تم تسجيل الخروج بأمان' : 'Signed out securely', 'info');
   }, [locale, navigate, notify]);
 
   const switchRolePreview = useCallback(
     async (role: UserRoleType) => {
+      if (user?.user_type !== 'super_admin') {
+        throw new Error('Only Super Admin can start a role preview.');
+      }
+      if (role === 'super_admin') return;
+      const adminToken = getApiAccessToken();
+      if (!adminToken) throw new Error('Admin session is unavailable. Please sign in again.');
       const data = await apiRequest<{ accessToken: string; user: SafeUserDTO }>('/auth/role-preview', {
         method: 'POST',
         body: JSON.stringify({ target_role: role }),
       });
+      setAdminPreviewOrigin({ token: adminToken, user });
       setApiAccessToken(data.accessToken);
       setUser(data.user);
       const scopeRouteMap: Record<UserRoleType, string> = {
@@ -318,8 +334,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
       navigate(scopeRouteMap[role]);
     },
-    [navigate]
+    [navigate, user]
   );
+
+  const exitRolePreview = useCallback(async () => {
+    if (!adminPreviewOrigin) return;
+    try {
+      await apiRequest('/auth/logout', { method: 'POST' });
+    } catch {
+      // Restore the original admin session even if the preview session has expired.
+    }
+    setApiAccessToken(adminPreviewOrigin.token);
+    setUser(adminPreviewOrigin.user);
+    setAdminPreviewOrigin(null);
+    navigate('/dashboard/admin');
+  }, [adminPreviewOrigin, navigate]);
 
   const addToCart = useCallback(
     async (variantId: string, quantity = 1) => {
@@ -365,6 +394,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setAuthSession,
         logout,
         switchRolePreview,
+        isRolePreview: Boolean(adminPreviewOrigin && user?.user_type !== 'super_admin'),
+        exitRolePreview,
         authStatus,
         refreshAuthStatus,
         bootstrap,

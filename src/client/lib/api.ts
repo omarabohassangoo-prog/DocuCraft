@@ -100,8 +100,9 @@ export function exportRowsToCsv(
   rows: (string | number | boolean | null | undefined)[][]
 ) {
   const escapeCell = (cell: unknown) => {
-    const str = String(cell ?? '');
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    const raw = String(cell ?? '');
+    const str = typeof cell === 'string' && /^[\t\r\n ]*[=+\-@]/.test(raw) ? `'${raw}` : raw;
+    if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
       return `"${str.replace(/"/g, '""')}"`;
     }
     return str;
