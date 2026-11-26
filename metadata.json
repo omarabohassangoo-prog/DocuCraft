@@ -1,0 +1,6 @@
+{
+  "name": "أفق للتجارة | Ufuq Multi-Vendor Commerce",
+  "description": "منصة متكاملة للتجارة الإلكترونية متعددة التجار تدعم إدارة المنتجات والمخزون، الدفع الإلكتروني عبر PayPal وStripe ومدى/Tap، الإشعارات متعددة القنوات، ولوحات التحكم حسب الصلاحيات.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

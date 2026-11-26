@@ -1,0 +1,66 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --font-arabic: "IBM Plex Sans Arabic", system-ui, -apple-system, sans-serif;
+  --font-latin: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --brand-primary: #0f4c3a;
+  --brand-primary-hover: #0a3629;
+  --brand-accent: #b45309;
+  --surface-canvas: #fafaf9;
+  --surface-card: #ffffff;
+  --surface-muted: #f4f4f5;
+  --border-hairline: #e4e4e7;
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+}
+
+.dark {
+  --brand-primary: #10b981;
+  --brand-primary-hover: #059669;
+  --brand-accent: #f59e0b;
+  --surface-canvas: #09090b;
+  --surface-card: #111114;
+  --surface-muted: #18181b;
+  --border-hairline: #27272a;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+}
+
+.theme-brand {
+  --surface-canvas: #f6f8f7;
+  --surface-card: #ffffff;
+  --surface-muted: #ebf0ed;
+  --border-hairline: #d4dfd9;
+}
+
+html[lang="ar"] body {
+  font-family: var(--font-arabic);
+}
+
+html[lang="en"] body {
+  font-family: var(--font-latin);
+}
+
+body {
+  background-color: var(--surface-canvas);
+  color: var(--text-primary);
+  transition: background-color 180ms cubic-bezier(0.16, 1, 0.3, 1), color 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
